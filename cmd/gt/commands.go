@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -175,23 +176,31 @@ func errNotInStack(branch string) error {
 		branch)
 }
 
-// cmdSubmit maps onto `gh stack submit`, which always covers the whole stack.
+// cmdSubmit is the fast submit: validate locally → load remote snapshot →
+// build a pure plan → no-op short-circuit → restack → one atomic push → PR
+// mutations → stack object update → persist. --native delegates to the legacy
+// `gh stack submit` path, but only before any mutation (decision #8).
 //
-// gh stack opens its editor whenever it has a terminal, but Graphite's submit
-// does not, so gt passes --auto by default and keeps -e for the times the
-// editor is wanted. --auto creates new PRs as drafts, matching what -n did
-// before; -p adds --open, which also publishes PRs that were already drafts, so
-// it is never implied.
+// Scope (decision #13): trunk→current by default. Upstack branches prompt
+// before they are included; --stack / `gt ss` skips the prompt. -u filters
+// out branches without open PRs (decision #7, enforced). Clean submit -u is
+// zero git push and zero gh mutations (IsNoOp short-circuit, decision #6).
+// A changed submit is exactly one `git push --atomic` regardless of stack
+// depth (decision #5).
 func cmdSubmit(args []string) error {
 	fs := newFlags("submit")
-	// -d and -n now describe the default. They stay so that the flags people
-	// already type keep working.
-	draft := fs.BoolP("draft", "d", false, "create new PRs as drafts (the default)")
+	draft := fs.BoolP("draft", "d", false, "create new PRs as drafts")
 	publish := fs.BoolP("publish", "p", false, "mark PRs ready for review")
 	noEdit := fs.BoolP("no-edit", "n", false, "skip the PR metadata editor (the default)")
-	edit := fs.BoolP("edit", "e", false, "open the gh stack submit editor")
-	stack := fs.Bool("stack", false, "submit the whole stack (always on with gh stack)")
-	updateOnly := fs.BoolP("update-only", "u", false, "only update existing PRs (gh stack still creates missing ones)")
+	edit := fs.BoolP("edit", "e", false, "open the gh stack submit editor (with --native)")
+	stack := fs.Bool("stack", false, "submit the whole stack")
+	updateOnly := fs.BoolP("update-only", "u", false, "only update existing PRs; branches without open PRs are skipped")
+	dryRun := fs.Bool("dry-run", false, "print the plan without mutating")
+	always := fs.Bool("always", false, "run even when the stack is up to date")
+	noVerify := fs.Bool("no-verify", false, "pass --no-verify to git push")
+	native := fs.Bool("native", false, "delegate to gh stack submit (the legacy path)")
+	restack := fs.Bool("restack", true, "cascade restack before pushing (default on)")
+	force := fs.BoolP("force", "f", false, "force restack and push even when unchanged")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -201,20 +210,340 @@ func cmdSubmit(args []string) error {
 	if *edit && *noEdit {
 		return fmt.Errorf("--edit and --no-edit conflict")
 	}
-	if !*stack {
-		fmt.Fprintln(os.Stderr,
-			"gt: note — gh stack submit covers the whole stack, not just the current branch and below.\n"+
-				"    Pass -e to pick branches in the editor.")
+	opts := SubmitOpts{
+		Stack:      *stack,
+		UpdateOnly: *updateOnly,
+		Always:     *always,
+		Publish:    *publish,
+		Draft:      *draft,
+		DryRun:     *dryRun,
+		Restack:    *restack,
+		Force:      *force,
+		NoVerify:   *noVerify,
 	}
-	if *updateOnly {
-		fmt.Fprintln(os.Stderr,
-			"gt: note — gh stack submit creates PRs for branches that do not have them.\n"+
-				"    Pass -e and deselect those branches to update existing PRs only.")
+
+	repo, err := loadRepoStacks()
+	if err != nil {
+		return err
 	}
-	if *draft && *edit {
-		fmt.Fprintln(os.Stderr, "gt: note — set draft with the CREATE AS toggle in the submit editor.")
+	current, err := currentBranch()
+	if err != nil {
+		return err
 	}
-	captured, err := runTee("gh", submitArgs(*edit, *publish)...)
+
+	// Pre-mutation validation (decision #10). --native may still proceed
+	// here, before any mutation has happened (decision #8); otherwise surface
+	// the error and a hint pointing at the fallback.
+	if verr := validateStackForMutation(repo, current); verr != nil {
+		if *native {
+			return nativeSubmit(*edit, *publish, fs.Args())
+		}
+		fmt.Fprintln(os.Stderr, verr)
+		fmt.Fprintln(os.Stderr, "gt: hint — re-run with --native to delegate to gh stack submit")
+		return verr
+	}
+	if *native {
+		return nativeSubmit(*edit, *publish, fs.Args())
+	}
+
+	if !opts.Stack {
+		if stack, ok := findStackForBranch(repo, current); ok {
+			if above := upstackOf(stack.trackedStack, current); len(above) > 0 {
+				if confirmSubmitUpstack(above) {
+					opts.Stack = true
+				}
+			}
+		}
+	}
+
+	// Gather branches + knownPRs across the current stack. The snapshot
+	// covers the whole stack so any scope (trunk→current or --stack) is
+	// satisfied; ResolveSubmitScope narrows the plan.
+	branches, knownPRs := submitStackBranches(repo, current)
+	snap, snapErr := LoadRemoteSnapshot(branches, knownPRs)
+	if snap == nil {
+		return snapErr
+	}
+	if snapErr != nil {
+		fmt.Fprintf(os.Stderr, "gt: could not load pull requests (%v); proceeding with refs only\n", snapErr)
+	}
+
+	plan, err := BuildSubmitPlan(repo, current, snap, opts)
+	if err != nil {
+		return err
+	}
+
+	// No-op fast path (decision #6): zero pushes, zero mutations.
+	if plan.IsNoOp() && !opts.Always {
+		fmt.Fprintln(os.Stderr, "Stack already up to date")
+		return nil
+	}
+
+	if opts.DryRun {
+		printSubmitPlan(os.Stderr, plan)
+		return nil
+	}
+
+	mut := MutationState{}
+
+	// Restack before any network I/O (decision #4). Local refs move here; the
+	// remote lease ExpectedOld stays from the snapshot.
+	if opts.Restack {
+		moved, rerr := restackForSubmit(repo, current, opts.Force)
+		if rerr != nil {
+			return rerr
+		}
+		if moved {
+			mut.GitMutated = true
+			for i := range plan.Pushes {
+				sha, err := branchHead(plan.Pushes[i].Branch)
+				if err != nil {
+					return err
+				}
+				plan.Pushes[i].LocalSHA = sha
+			}
+		}
+	}
+
+	// One atomic push (decision #5). No --force fallback on lease failure.
+	if len(plan.Pushes) > 0 {
+		if perr := AtomicPush(plan.Pushes, PushOpts{
+			Force:    opts.Force,
+			NoVerify: opts.NoVerify,
+			DryRun:   opts.DryRun,
+		}); perr != nil {
+			explainSwallowedPush("")
+			return perr
+		}
+		mut.GitMutated = true
+	}
+
+	// PR mutations via gh subprocess. Create errors abort (state would be
+	// inconsistent after a push with no PR); base/publish/automerge failures
+	// are warnings and continue.
+	if cerr := createPRs(plan.Creates, opts.Draft); cerr != nil {
+		return cerr
+	}
+	if len(plan.Creates) > 0 {
+		mut.RemoteMutated = true
+	}
+	if werr := updatePRBases(plan.BaseUpdates); werr != nil {
+		fmt.Fprintf(os.Stderr, "gt: warning: %v\n", werr)
+	} else if len(plan.BaseUpdates) > 0 {
+		mut.RemoteMutated = true
+	}
+	if werr := publishPRs(plan.PublishUpdates); werr != nil {
+		fmt.Fprintf(os.Stderr, "gt: warning: %v\n", werr)
+	} else if len(plan.PublishUpdates) > 0 {
+		mut.RemoteMutated = true
+	}
+	if werr := disableAutoMerges(plan.AutoMergeDisables); werr != nil {
+		fmt.Fprintf(os.Stderr, "gt: warning: %v\n", werr)
+	} else if len(plan.AutoMergeDisables) > 0 {
+		mut.RemoteMutated = true
+	}
+
+	// Stack object update. Warn on failure; the push already succeeded.
+	if plan.StackUpdate != nil {
+		client, cerr := NewStackRemoteClient()
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "gt: warning: stack remote: %v\n", cerr)
+		} else {
+			changed, serr := syncStackOrder(client, plan.StackUpdate.StackID, plan.StackUpdate.Numbers)
+			if serr != nil {
+				fmt.Fprintf(os.Stderr, "gt: warning: stack update: %v\n", serr)
+			} else if changed {
+				mut.RemoteMutated = true
+			}
+		}
+	}
+
+	// Persist local stack state once if restack moved refs.
+	if mut.GitMutated {
+		if perr := persistSyncState(repo); perr != nil {
+			return perr
+		}
+	}
+
+	return nil
+}
+
+func confirmSubmitUpstack(names []string) bool {
+	listed := strings.Join(names, ", ")
+	if !(isTerminal(os.Stdin) && isTerminal(os.Stderr)) {
+		fmt.Fprintf(os.Stderr, "gt: not submitting upstack %s (pass --stack to include them)\n", listed)
+		return false
+	}
+	return confirm(fmt.Sprintf("gt: also submit %d upstack branch(es) (%s)?", len(names), listed), false)
+}
+
+// submitStackBranches gathers every branch (trunk + members) of the stack
+// containing current, plus a branch→PR-number map for the snapshot loader.
+func submitStackBranches(repo *repoStackState, current string) ([]string, map[string]int) {
+	stack, ok := findStackForBranch(repo, current)
+	if !ok {
+		return nil, nil
+	}
+	var branches []string
+	knownPRs := map[string]int{}
+	add := func(b trackedBranch) {
+		if b.Branch == "" {
+			return
+		}
+		branches = append(branches, b.Branch)
+		if b.PullRequest != nil && b.PullRequest.Number != 0 {
+			knownPRs[b.Branch] = b.PullRequest.Number
+		}
+	}
+	add(stack.Trunk)
+	for _, b := range stack.Branches {
+		add(b)
+	}
+	return branches, knownPRs
+}
+
+// restackForSubmit runs CascadeRestack on the current stack's branches. It
+// returns moved=true when any local ref changed.
+func restackForSubmit(repo *repoStackState, current string, force bool) (bool, error) {
+	stack, ok := findStackForBranch(repo, current)
+	if !ok {
+		return false, nil
+	}
+	results, _, err := CascadeRestack(stack.Branches, RestackOpts{Force: force})
+	if err != nil {
+		return false, err
+	}
+	for _, r := range results {
+		if r.Moved {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// printSubmitPlan writes a human-readable summary of the plan to w.
+func printSubmitPlan(w *os.File, plan SubmitPlan) {
+	if len(plan.Pushes) > 0 {
+		fmt.Fprintln(w, "push:")
+		for _, p := range plan.Pushes {
+			verb := "update"
+			if p.IsNew {
+				verb = "create"
+			}
+			fmt.Fprintf(w, "  %s %s (%s)\n", verb, p.Branch, shortSHA(p.LocalSHA))
+		}
+	}
+	if len(plan.Creates) > 0 {
+		fmt.Fprintln(w, "create PR:")
+		for _, c := range plan.Creates {
+			fmt.Fprintf(w, "  %s -> %s\n", c.Branch, c.Parent)
+		}
+	}
+	if len(plan.BaseUpdates) > 0 {
+		fmt.Fprintln(w, "update base:")
+		for _, b := range plan.BaseUpdates {
+			fmt.Fprintf(w, "  PR %d -> %s\n", b.PRNumber, b.NewBase)
+		}
+	}
+	if len(plan.PublishUpdates) > 0 {
+		fmt.Fprintln(w, "publish:")
+		for _, p := range plan.PublishUpdates {
+			fmt.Fprintf(w, "  PR %d\n", p.PRNumber)
+		}
+	}
+	if len(plan.AutoMergeDisables) > 0 {
+		fmt.Fprintln(w, "disable auto-merge:")
+		for _, a := range plan.AutoMergeDisables {
+			fmt.Fprintf(w, "  PR %d\n", a.PRNumber)
+		}
+	}
+	if plan.StackUpdate != nil {
+		fmt.Fprintf(w, "stack update: %s %v\n", plan.StackUpdate.StackID, plan.StackUpdate.Numbers)
+	}
+	if plan.IsNoOp() {
+		fmt.Fprintln(w, "(no changes)")
+	}
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
+// createPRs opens one PR per PRCreate via `gh pr create`. A create failure
+// aborts: the branch was already pushed, so a missing PR leaves the stack
+// inconsistent and a retry of submit would re-push needlessly.
+func createPRs(creates []PRCreate, draft bool) error {
+	for _, c := range creates {
+		title, body := prTitleAndBody(c.Branch, c.Parent)
+		args := []string{"pr", "create", "--base", c.Parent, "--head", c.Branch, "--title", title, "--body", body}
+		if draft {
+			args = append(args, "--draft")
+		}
+		if err := run("gh", args...); err != nil {
+			return fmt.Errorf("create PR for %s: %w", c.Branch, err)
+		}
+	}
+	return nil
+}
+
+// prTitleAndBody builds a PR title from the first commit on the branch and a
+// body from the full log, both scoped to Parent..Branch.
+func prTitleAndBody(branch, parent string) (string, string) {
+	log, err := capture("git", "log", "--format=%s", parent+".."+branch)
+	if err != nil {
+		return branch, ""
+	}
+	lines := strings.Split(log, "\n")
+	title := branch
+	if len(lines) > 0 && lines[0] != "" {
+		title = lines[0]
+	}
+	full, err := capture("git", "log", "--format=%H%n  %s%n", parent+".."+branch)
+	if err != nil {
+		return title, ""
+	}
+	return title, full
+}
+
+// updatePRBases retargets each PR's base via `gh pr edit --base`.
+func updatePRBases(updates []PRBaseUpdate) error {
+	for _, u := range updates {
+		if err := run("gh", "pr", "edit", fmt.Sprintf("%d", u.PRNumber), "--base", u.NewBase); err != nil {
+			return fmt.Errorf("update base for PR %d: %w", u.PRNumber, err)
+		}
+	}
+	return nil
+}
+
+// publishPRs marks each draft PR ready via `gh pr ready`.
+func publishPRs(updates []PRPublishUpdate) error {
+	for _, u := range updates {
+		if err := run("gh", "pr", "ready", fmt.Sprintf("%d", u.PRNumber)); err != nil {
+			return fmt.Errorf("publish PR %d: %w", u.PRNumber, err)
+		}
+	}
+	return nil
+}
+
+// disableAutoMerges turns auto-merge off via `gh pr merge --disable-auto`.
+func disableAutoMerges(updates []PRAutoMergeDisable) error {
+	for _, u := range updates {
+		if err := run("gh", "pr", "merge", fmt.Sprintf("%d", u.PRNumber), "--disable-auto"); err != nil {
+			return fmt.Errorf("disable auto-merge for PR %d: %w", u.PRNumber, err)
+		}
+	}
+	return nil
+}
+
+// nativeSubmit is the --native fallback: it delegates to the legacy
+// `gh stack submit` path with the appropriate flags.
+func nativeSubmit(edit, publish bool, extra []string) error {
+	gh := submitArgs(edit, publish)
+	gh = append(gh, extra...)
+	captured, err := runTee("gh", gh...)
 	if err != nil {
 		explainSwallowedPush(captured)
 	}
@@ -284,32 +613,237 @@ func submitArgs(edit, publish bool) []string {
 func cmdSync(args []string) error {
 	fs := newFlags("sync")
 	deleteAll := fs.BoolP("delete-all", "d", false, "delete stale stack branches without prompting")
+	noRestack := fs.Bool("no-restack", false, "skip the cascade restack step")
+	force := fs.BoolP("force", "f", false, "force restack even when ancestry is unchanged")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
-	if err := fastForwardTrunk(); err != nil {
-		return err
-	}
-	branch, err := currentBranch()
+
+	// Sync is repo-wide (decision #9): every stack, not just HEAD's.
+	repo, err := loadRepoStacks()
 	if err != nil {
 		return err
 	}
-	pos, _, err := requireStackPosition(branch)
+
+	branches := collectSyncBranches(repo)
+	knownPRs := buildKnownPRs(repo)
+
+	// One concurrent load: targeted ls-remote (refs) + one batched GraphQL
+	// (PRs). Clean sync stops here at a single ls-remote.
+	snap, snapErr := LoadRemoteSnapshot(branches, knownPRs)
+	if snap == nil {
+		return snapErr
+	}
+	if snapErr != nil {
+		fmt.Fprintf(os.Stderr, "gt: could not load pull requests (%v); proceeding with refs only\n", snapErr)
+	}
+
+	plan := BuildSyncPlan(repo, snap)
+
+	moved, err := executeSyncPlan(plan, snap, *noRestack, *force)
 	if err != nil {
 		return err
 	}
-	if pos.inStack {
-		stderr, err := runRecording("gh", "stack", "rebase")
-		if err != nil && !ignorableStackSyncError(stderr) {
+	if moved {
+		if err := persistSyncState(repo); err != nil {
 			return err
 		}
 	}
-	return pruneStaleBranches(*deleteAll)
+
+	return pruneStaleBranches(snap, *deleteAll)
 }
 
+// ignorableStackSyncError reports whether a stderr from a stack rebase is
+// safe to swallow: a branch not in a stack, or a worktree holding the ref.
+// Kept for tests; the rewritten cmdSync no longer calls `gh stack rebase`.
 func ignorableStackSyncError(stderr string) bool {
 	return strings.Contains(stderr, "is not part of a stack") ||
 		strings.Contains(stderr, "cannot force update the branch")
+}
+
+// collectSyncBranches gathers every branch the planner needs to know about:
+// the trunk of each stack plus all members. Duplicates are removed.
+func collectSyncBranches(repo *repoStackState) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	// Always load the trunk even when no stack is tracked, so a bare-trunk
+	// sync can still see whether origin/main is ahead (the plan derives the
+	// trunk from repo stacks, which is empty here).
+	add(fallbackTrunk(trunkNames()))
+	for _, s := range repo.Stacks {
+		add(s.Trunk.Branch)
+		for _, b := range s.Branches {
+			add(b.Branch)
+		}
+	}
+	return out
+}
+
+// buildKnownPRs maps branch→PR number from repo stack metadata, so the
+// snapshot loader can query GitHub for the PRs we already track.
+func buildKnownPRs(repo *repoStackState) map[string]int {
+	m := map[string]int{}
+	for _, s := range repo.Stacks {
+		if s.Trunk.PullRequest != nil && s.Trunk.PullRequest.Number != 0 {
+			m[s.Trunk.Branch] = s.Trunk.PullRequest.Number
+		}
+		for _, b := range s.Branches {
+			if b.PullRequest != nil && b.PullRequest.Number != 0 {
+				m[b.Branch] = b.PullRequest.Number
+			}
+		}
+	}
+	return m
+}
+
+// executeSyncPlan runs the trunk fast-forward, per-stack branch fast-forwards,
+// and cascade restacks. It returns moved=true when any local ref changed, so
+// the caller can persist stack state once. No remote mutations happen here;
+// a restack conflict aborts with the error before any push.
+func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, noRestack bool, force bool) (bool, error) {
+	// The plan derives the trunk from repo stacks; when none is tracked it
+	// cannot, so resolve the effective trunk here (executor may touch git).
+	// The snapshot always carries it because collectSyncBranches adds the
+	// fallback trunk.
+	trunk := plan.Trunk.Branch
+	if trunk == "" {
+		trunk = fallbackTrunk(trunkNames())
+	}
+	trunkBehind := false
+	if trunk != "" && !plan.Trunk.FastForward {
+		local, _ := branchHead(trunk)
+		if snap != nil {
+			if ref, ok := snap.Refs.Refs[trunk]; ok && ref.Exists && ref.RemoteSHA != "" && ref.RemoteSHA != local {
+				trunkBehind = true
+			}
+		}
+	}
+
+	// Determine whether any branch might need a fast-forward, so we fetch
+	// only when necessary (clean sync stays at one ls-remote).
+	needFetch := plan.Trunk.FastForward || trunkBehind
+	behindByStack := make([][]string, len(plan.Stacks))
+	for i := range plan.Stacks {
+		behindByStack[i] = branchesBehindRemote(plan.Stacks[i].Stack, snap)
+		if len(behindByStack[i]) > 0 {
+			needFetch = true
+		}
+	}
+	if needFetch {
+		if err := fetchStackOrigin(); err != nil {
+			return false, err
+		}
+	}
+
+	var moved bool
+
+	if plan.Trunk.FastForward || trunkBehind {
+		if err := fastForwardBranch(trunk); err != nil {
+			return moved, err
+		}
+		// fastForwardBranch is a no-op when the move is not a true FF, so
+		// re-check the local SHA to decide whether state moved.
+		if didMove(trunk, plan.Trunk.LocalSHA) {
+			moved = true
+		}
+	}
+
+	for i, sp := range plan.Stacks {
+		for _, branch := range behindByStack[i] {
+			if err := fastForwardBranch(branch); err != nil {
+				return moved, err
+			}
+		}
+
+		if noRestack {
+			continue
+		}
+		if stackAllInOtherWorktrees(sp.Stack) {
+			continue
+		}
+
+		results, _, err := CascadeRestack(sp.Stack.Branches, RestackOpts{Force: force})
+		if err != nil {
+			return moved, err
+		}
+		for _, r := range results {
+			if r.Moved {
+				moved = true
+			}
+		}
+	}
+	return moved, nil
+}
+
+// branchesBehindRemote returns the members of a stack whose tracked Head
+// differs from the remote SHA in the snapshot. The snapshot comes from
+// LoadRemoteSnapshot's targeted ls-remote, so this is network-free.
+func branchesBehindRemote(stack trackedStack, snap *RemoteSnapshot) []string {
+	if snap == nil {
+		return nil
+	}
+	var behind []string
+	for _, b := range stack.Branches {
+		if b.Branch == "" {
+			continue
+		}
+		ref, ok := snap.Refs.Refs[b.Branch]
+		if !ok || !ref.Exists {
+			continue
+		}
+		if b.Head != "" && b.Head != ref.RemoteSHA {
+			behind = append(behind, b.Branch)
+		}
+	}
+	return behind
+}
+
+// stackAllInOtherWorktrees reports whether every member of the stack is
+// checked out in a worktree other than this one. Such a stack cannot be
+// restacked from here and is skipped.
+func stackAllInOtherWorktrees(stack trackedStack) bool {
+	cur, err := currentBranch()
+	if err != nil {
+		return false
+	}
+	anyLocal := false
+	for _, b := range stack.Branches {
+		if b.Branch == "" {
+			continue
+		}
+		wt, err := worktreePathForBranch(b.Branch)
+		if err != nil || wt == "" || b.Branch == cur {
+			anyLocal = true
+			break
+		}
+	}
+	return !anyLocal
+}
+
+// didMove reports whether the branch's current SHA differs from before.
+func didMove(branch, oldSHA string) bool {
+	now, err := capture("git", "rev-parse", branch)
+	if err != nil {
+		return false
+	}
+	return now != oldSHA
+}
+
+// persistSyncState writes the reconciled repo state back to this worktree's
+// gh-stack file. It is called once at the end of sync when a local ref moved.
+func persistSyncState(repo *repoStackState) error {
+	dir, err := gitStackDir()
+	if err != nil {
+		return err
+	}
+	return writeStackFile(filepath.Join(dir, ghStackCompat.StateFileName), repo.asState())
 }
 
 func cmdRestack(args []string) error {

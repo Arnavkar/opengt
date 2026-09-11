@@ -1,17 +1,19 @@
-# gtstack
+# opengt
 
 > Graphite muscle memory, backed by GitHub's native stacks.
 
-`gtstack` installs a `gt` command that translates the Graphite CLI commands
+`opengt` installs a `gt` command that translates the Graphite CLI commands
 you already know into [GitHub's official `gh stack`][gh-stack] commands and
 plain Git operations.
 
 It is intentionally a thin compatibility shim. `gh stack` remains the source
-of truth for stack state; `gtstack` has no backend, metadata format, or config
-of its own.
+of truth for stack state; `opengt` has no backend, metadata format, or config
+of its own. The hot paths — `gt sync` and `gt submit` — are implemented
+directly on top of Git and the GitHub API for speed, and fall back to the
+legacy `gh stack` implementation with `--native`.
 
 > [!IMPORTANT]
-> `gtstack` is early software. It currently supports **linear stacks only** and
+> `opengt` is early software. It currently supports **linear stacks only** and
 > targets `gh-stack` **v0.1.0**, state schema **v1**. When an operation cannot
 > be translated safely, it stops with an actionable error instead of guessing.
 
@@ -40,14 +42,14 @@ brew install hSATAC/toybox/gtstack
 Or install it with Go:
 
 ```sh
-go install github.com/hSATAC/gtstack/cmd/gt@latest
+go install github.com/Arnavkar/opengt/cmd/gt@latest
 ```
 
 Or build from source and put `gt` on your `PATH`:
 
 ```sh
-git clone https://github.com/hSATAC/gtstack.git
-cd gtstack
+git clone https://github.com/Arnavkar/opengt.git
+cd opengt
 mkdir -p bin
 go build -o bin/gt ./cmd/gt
 export PATH="$PWD/bin:$PATH"
@@ -55,13 +57,13 @@ export PATH="$PWD/bin:$PATH"
 
 Linux builds are attached to each [release][releases] as `tar.gz` archives.
 
-`gtstack` deliberately uses the same binary name as Graphite. If Graphite is
+`opengt` deliberately uses the same binary name as Graphite. If Graphite is
 still installed, use `type -a gt` to see which binary your shell will run.
 You can distinguish them with:
 
 ```console
 $ gt --version
-gt 0.1.0 (gh-stack shim)
+gt 0.1.0 (opengt)
 ```
 
 ### Use it like Graphite
@@ -102,21 +104,22 @@ gt restack  → gh stack rebase
 
 Others have actively conflicting meanings. Graphite's `gt modify` amends the
 current branch and restacks its descendants, while `gh stack modify` opens a
-TUI for restructuring the stack. `gtstack` translates the intent instead of
+TUI for restructuring the stack. `opengt` translates the intent instead of
 blindly forwarding the command.
 
 ## Command mapping
 
-| Graphite command | What `gtstack` runs |
+| Graphite command | What `opengt` runs |
 | --- | --- |
 | `gt create` / `gt c` | `gh stack init` for a new stack, or `gh stack add` at the top of an existing stack |
 | `gt modify` / `gt m` | `git commit [--amend]`, then `gh stack rebase --upstack --no-trunk` |
-| `gt submit` / `gt s` / `gt ss` | `gh stack submit --auto` (`-e` opens the editor; `-u` is accepted but cannot skip new PRs) |
-| `gt sync` | fetch trunk + stack branches, restack (does not push; `-d` deletes stale **stack** branches only) |
+| `gt submit` / `gt s` / `gt ss` | validate + plan + atomic push + PR create/update + stack update. `--native` falls back to `gh stack submit` |
+| `gt sync` | fetch (targeted ls-remote) + fast-forward trunk/branches + cascade restack + prune. `--native` falls back to `gh stack rebase` |
 | `gt restack` | `gh stack rebase` (`-d`/`-u` map to `--downstack`/`--upstack`) |
 | `gt doctor` | diagnose Git vs local `gh-stack` vs worktrees vs GitHub (`--repair`, `--json`) |
 | `gt continue` / `gt abort` | Continue or abort the paused `gh stack rebase` or `gh stack modify` |
 | `gt checkout` / `gt co` | tree of local stacks, or `gh stack checkout` / `git checkout` |
+| `gt delete` | same tree picker, then delete the chosen branch and restack what was above it |
 | `gt get <pr>` | `gh stack checkout <pr>` |
 | `gt log` / `gt ls` / `gt ll` | `gh stack view`, `gh stack view --short`, or `git log --graph` |
 | `gt up` / `u`, `down` / `d`, `top` / `t`, `bottom` / `b`, `trunk` | The corresponding `gh stack` navigation command |
@@ -132,9 +135,11 @@ rather than silently dropped.
 
 ## Normal Git is supported
 
-`gtstack` is a wrapper, not a gate. Commits, checkouts, cherry-picks, and other
-Git commands do not have to go through `gt`. When those operations change stack
-structure, `gt doctor` explains the disagreement and can repair **metadata**.
+`opengt` is a wrapper, not a gate. Any command `gt` does not implement is
+passed through to `git` (`gt status` is `git status`, `gt commit` is
+`git commit`). Graphite commands that cannot be translated still stop with an
+error instead of being forwarded. When Git operations change stack structure,
+`gt doctor` explains the disagreement and can repair **metadata**.
 
 ```text
 git commit          safe
@@ -193,33 +198,90 @@ schema is a hard stop.
 
 ### Linear stacks only
 
-`gh stack` represents a stack as a flat ordered list. `gtstack` therefore does
+`gh stack` represents a stack as a flat ordered list. `opengt` therefore does
 not support forks:
 
 - `gt create` must run from the top of the current stack.
-- If a branch belongs to more than one stack, `gtstack` stops and asks you to
+- If a branch belongs to more than one stack, `opengt` stops and asks you to
   use `gh stack` directly.
 
-### `gt submit` covers the whole stack
+### `gt submit` stops at the current branch
 
-Graphite's `gt submit` submits the current branch and its downstack branches.
-`gh stack submit` covers the entire stack, so `gtstack` does too. Pass `-e` to
-open the submit editor and deselect branches. Graphite's `-u` / `--update-only`
-is accepted so `gt ss -u` still runs; there is no way to skip branches without
-PRs, so `gt` prints a note and submits them anyway.
+Graphite's `gt submit` submits the current branch and its downstack. `opengt`
+does the same: default scope is trunk→current. If there are branches above
+you, it asks before including them (`[y/N]`). `--stack` or `gt ss` submits the
+whole stack without asking. Pass `-e` to open the editor (with `--native`)
+and deselect branches. `-u` / `--update-only` is enforced: branches without
+open PRs are excluded from scope entirely, so `gt ss -u` never pushes or
+creates a PR for them.
 
-`gh stack submit` opens that editor whenever it has a terminal. Graphite's
-submit does not, so `gt submit` passes `--auto` and skips it. New PRs are
-created as drafts; pass `-p` to mark them ready for review.
+The fast path validates locally, loads a remote snapshot, builds a pure plan,
+and short-circuits when nothing changed ("Stack already up to date", zero
+pushes, zero mutations). A changed submit does exactly one
+`git push --atomic` with per-ref `--force-with-lease` regardless of stack
+depth; on lease failure the entire push fails and no branch moves. PR
+discovery is a single batched GraphQL call. New PRs are created as drafts;
+pass `-p` to mark them ready for review.
 
 > [!NOTE]
-> `-p` maps to `--open`, which marks **new and existing** PRs ready for review.
-> It will publish a PR you had deliberately left as a draft, so `gt submit`
-> never passes it for you.
+> `-p` publishes **new and existing** PRs ready for review. It will publish
+> a PR you had deliberately left as a draft, so `gt submit` never passes it
+> for you.
+
+#### `gt submit` / `gt ss` flags
+
+| Flag | Meaning |
+| --- | --- |
+| `--stack` | submit the whole stack without asking (also `gt ss`) |
+| `-d`, `--draft` | create new PRs as drafts |
+| `-p`, `--publish` | mark PRs ready for review (new and existing) |
+| `-u`, `--update-only` | only update existing PRs; branches without open PRs are skipped |
+| `-e`, `--edit` | open the `gh stack submit` editor (implies `--native`) |
+| `-n`, `--no-edit` | skip the PR metadata editor (the default) |
+| `--dry-run` | print the plan without mutating |
+| `--always` | run even when the stack is up to date |
+| `--restack` / `--no-restack` | cascade restack before pushing (default on) |
+| `-f`, `--force` | force restack and push even when unchanged |
+| `--no-verify` | pass `--no-verify` to `git push` |
+| `--native` | delegate to the legacy `gh stack submit` (see below) |
+
+### `gt sync`
+
+`gt sync` is repo-wide: it fast-forwards every stack's trunk and branches,
+cascades a restack across each stack, and prunes stale stack branches. It
+does not push. `-d` deletes stale **stack** branches without prompting;
+ordinary untracked branches are left alone, even if their upstream is gone.
+
+A clean sync makes zero `gh stack` calls — one targeted `git ls-remote` plus
+one batched GraphQL call for PR discovery, then local fast-forwards and
+restacks. `--native` falls back to `gh stack rebase` for the legacy behavior.
+
+#### `gt sync` flags
+
+| Flag | Meaning |
+| --- | --- |
+| `-d`, `--delete-all` | delete stale stack branches without prompting |
+| `--no-restack` | skip the cascade restack step |
+| `-f`, `--force` | force restack even when ancestry is unchanged |
+| `--native` | delegate to the legacy `gh stack rebase` (see below) |
+
+### `--native`: the legacy fallback
+
+`--native` makes `gt sync` and `gt submit` delegate to the legacy `gh stack`
+implementation (`gh stack rebase` / `gh stack submit`) instead of the native
+fast path. Use it when the native path refuses to proceed — for example,
+when validation finds an unsupported state — or when you simply want the
+`gh stack` behavior.
+
+`--native` is allowed **before any mutation** has happened (e.g. when
+pre-mutation validation fails). It is impossible **after** a mutation has
+started (a `git push` or any GitHub mutation): `gt` will not switch
+implementations mid-operation, since that could leave the stack in a
+half-mutated state.
 
 ### `gt modify` is implemented with Git
 
-`gh stack` has no equivalent of Graphite's amend operation. `gtstack` commits
+`gh stack` has no equivalent of Graphite's amend operation. `opengt` commits
 or amends with Git, then asks `gh stack` to rebase the upstack branches. If the
 current branch has no commits of its own, it creates a commit rather than
 rewriting its parent's commit.
@@ -241,7 +303,7 @@ untracked local branches, which go through Git. `gt switch` still opens
 
 ## Transparent by default
 
-Before running each native operation, `gtstack` prints the exact command to
+Before running each native operation, `opengt` prints the exact command to
 stderr:
 
 ```console
@@ -260,7 +322,7 @@ Color is disabled when stderr is not a terminal or when `NO_COLOR` is set.
 
 ## Unsupported Graphite commands
 
-`gtstack` is a workflow bridge, not a complete reimplementation of Graphite.
+`opengt` is a workflow bridge, not a complete reimplementation of Graphite.
 Each command below stops with the reason and the nearest `git` or `gh stack`
 alternative; run it to see the advice for that command.
 
@@ -270,7 +332,7 @@ translation.
 ### Available only in the `gh stack modify` TUI
 
 ```text
-fold  move  reorder  rename  delete
+fold  move  reorder  rename
 ```
 
 `gh stack` can perform these, but only inside an interactive editor. No flag
@@ -309,7 +371,7 @@ of its own, so `gt config` points at `gh`.
 
 ## Extension and state compatibility
 
-If `github/gh-stack` is missing, `gtstack` offers to install it interactively:
+If `github/gh-stack` is missing, `opengt` offers to install it interactively:
 
 ```text
 gt: the gh stack extension is not installed. Install it now? [Y/n]
@@ -318,7 +380,7 @@ gt: the gh stack extension is not installed. Install it now? [Y/n]
 In a non-interactive environment it never installs software automatically; it
 prints the installation command and exits instead.
 
-To decide whether `gt create` should initialize or extend a stack, `gtstack`
+To decide whether `gt create` should initialize or extend a stack, `opengt`
 reads every `.git/gh-stack` file in the repository (the current worktree git
 dir, the shared repository, and linked worktrees). Identical copies are
 deduplicated; incompatible orders are reported rather than merged. It refuses
@@ -327,4 +389,4 @@ cannot silently corrupt a stack.
 
 [gh-cli]: https://cli.github.com/
 [gh-stack]: https://github.com/github/gh-stack
-[releases]: https://github.com/hSATAC/gtstack/releases
+[releases]: https://github.com/Arnavkar/opengt/releases

@@ -45,7 +45,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      # Pinned to the release gtstack targets, so this job answers one
+      # Pinned to the release opengt targets, so this job answers one
       # question: does this change break gt? Whether a newer gh-stack breaks
       # gt is what the daily gh-stack-compat workflow is for.
       - name: Install the gh stack extension

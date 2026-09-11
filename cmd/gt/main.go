@@ -28,8 +28,8 @@ type command struct {
 var commands = []command{
 	{[]string{"create", "c"}, "gh stack init | gh stack add", cmdCreate},
 	{[]string{"modify", "m"}, "git commit + gh stack rebase --upstack --no-trunk", cmdModify},
-	{[]string{"submit", "s"}, "gh stack submit --auto", cmdSubmit},
-	{[]string{"ss"}, "gh stack submit --auto (whole stack)", func(a []string) error {
+	{[]string{"submit", "s"}, "push through current (asks before upstack)", cmdSubmit},
+	{[]string{"ss"}, "atomic push + PR update (whole stack)", func(a []string) error {
 		return cmdSubmit(append([]string{"--stack"}, a...))
 	}},
 	{[]string{"sync"}, "fetch + restack (no push)", cmdSync},
@@ -38,6 +38,7 @@ var commands = []command{
 	{[]string{"continue"}, "gh stack rebase|modify --continue", cmdContinue},
 	{[]string{"abort"}, "gh stack rebase|modify --abort", cmdAbort},
 	{[]string{"checkout", "co"}, "tree picker | gh stack checkout", cmdCheckout},
+	{[]string{"delete"}, "tree picker + restack", cmdDelete},
 	{[]string{"get"}, "gh stack checkout", cmdGet},
 	{[]string{"log"}, "gh stack view", cmdLog},
 	{[]string{"ls"}, "gh stack view --short", func(a []string) error {
@@ -71,7 +72,6 @@ var unsupported = map[string]string{
 	"move":      "gh stack exposes reordering only inside the `gh stack modify` TUI.",
 	"reorder":   "gh stack exposes reordering only inside the `gh stack modify` TUI.",
 	"rename":    "gh stack exposes rename only inside the `gh stack modify` TUI.",
-	"delete":    "gh stack drops branches only inside the `gh stack modify` TUI. `gh stack delete` removes the whole stack.",
 	"split":     "gh stack has no split. Use git rebase -i, then `gh stack modify` to re-track.",
 	"squash":    "gh stack has no squash. Use git reset --soft <parent> && git commit, then gt restack.",
 	"pop":       "gh stack has no pop. Use git reset --soft HEAD~1.",
@@ -103,8 +103,8 @@ func main() {
 	}
 	switch args[0] {
 	case "--version":
-		// Named to be told apart from the Graphite CLI this deliberately shadows.
-		fmt.Printf("gt %s (gh-stack shim)\n", version)
+		// Named to be told apart from Graphite's `gt` and from `gh stack`.
+		fmt.Printf("gt %s (opengt)\n", version)
 		return
 	case "help", "--help", "-h":
 		printHelp()
@@ -122,8 +122,7 @@ func main() {
 			return
 		}
 	}
-	fmt.Fprintf(os.Stderr, "gt: unknown command %q. Run `gt help`.\n", name)
-	os.Exit(2)
+	exit(run("git", args...))
 }
 
 // exit propagates a child process exit code, or reports our own error.
@@ -140,6 +139,15 @@ func exit(err error) {
 	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
+		// A bare *exec.ExitError is a passthrough command (git/gh spoke
+		// for itself); exit silently with its code. A gt error that
+		// *wraps* an exec.ExitError is one of our own steps failing (a
+		// restack conflict, a push lease failure) — print the gt
+		// message so the user sees what happened, not just the child's
+		// raw output.
+		if _, bare := err.(*exec.ExitError); !bare {
+			fmt.Fprintln(os.Stderr, "gt: "+err.Error())
+		}
 		os.Exit(ee.ExitCode())
 	}
 	fmt.Fprintln(os.Stderr, "gt: "+err.Error())
@@ -147,7 +155,7 @@ func exit(err error) {
 }
 
 func printHelp() {
-	fmt.Printf("gt %s — Graphite command names on top of `gh stack`.\n\n", version)
+	fmt.Printf("gt %s — opengt\n\n", version)
 	fmt.Println("COMMANDS")
 	for _, c := range commands {
 		label := c.names[0]
@@ -157,6 +165,7 @@ func printHelp() {
 		fmt.Printf("  %-22s → %s\n", label, c.maps)
 	}
 	fmt.Println("\nPass --help to any command for its flags.")
+	fmt.Println("Anything else is passed through to git.")
 	fmt.Println("Only linear stacks are supported; gt stops with an error at a fork.")
 }
 

@@ -1,6 +1,6 @@
 version: 2
 
-project_name: gtstack
+project_name: opengt
 
 before:
   hooks:
@@ -47,7 +47,7 @@ homebrew_casks:
       - gt
     binaries:
       - gt
-    homepage: https://github.com/hSATAC/gtstack
+    homepage: https://github.com/Arnavkar/opengt
     description: Graphite command names on top of gh stack
     license: MIT
     # withgraphite/tap/graphite installs its own bin/gt, so the two cannot both

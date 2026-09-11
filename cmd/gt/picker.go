@@ -9,6 +9,7 @@ import (
 )
 
 const pickerPrompt = "Checkout a branch (autocomplete or arrow keys)"
+const deleteBranchPrompt = "Delete a branch (autocomplete or arrow keys)"
 const deletePrompt = "Delete branches (space to toggle, enter to confirm)"
 
 func filterRows(rows []pickRow, q string) []pickRow {
@@ -33,12 +34,16 @@ func rowSearchText(r pickRow) string {
 }
 
 func pickBranch(rows []pickRow) (pickRow, error) {
-	chosen, err := runPicker(rows, pickerMode{prompt: pickerPrompt, cancel: "checkout cancelled"})
+	return pickOne(rows, pickerPrompt, "checkout cancelled")
+}
+
+func pickOne(rows []pickRow, prompt, cancel string) (pickRow, error) {
+	chosen, err := runPicker(rows, pickerMode{prompt: prompt, cancel: cancel})
 	if err != nil {
 		return pickRow{}, err
 	}
 	if len(chosen) == 0 {
-		return pickRow{}, fmt.Errorf("checkout cancelled")
+		return pickRow{}, fmt.Errorf("%s", cancel)
 	}
 	return chosen[0], nil
 }

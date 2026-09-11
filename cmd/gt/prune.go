@@ -30,18 +30,19 @@ type staleBranch struct {
 
 // pruneStaleBranches offers to delete local branches whose upstream is gone
 // or whose pull request has been merged or closed. Sync has already fetched
-// stacked remotes and dropped missing origin refs, so "gone" is visible.
-func pruneStaleBranches(deleteAll bool) error {
+// stacked remotes and dropped missing origin refs, so "gone" is visible. PR
+// state is consumed from snap (loaded once by LoadRemoteSnapshot) rather than
+// a fresh `gh pr list` shell-out.
+func pruneStaleBranches(snap *RemoteSnapshot, deleteAll bool) error {
 	branches, err := listStaleCandidates()
 	if err != nil {
 		return err
 	}
-	prs, err := listPullRequests()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "gt: could not list pull requests (%v); checking deleted remotes only\n", err)
-		prs = nil
+	prs, prsAvailable := prsFromSnapshot(snap)
+	if !prsAvailable {
+		fmt.Fprintf(os.Stderr, "gt: no pull request snapshot available; checking deleted remotes only\n")
 	}
-	stale := staleLocalsWithPRs(branches, prs, trunkNames(), err == nil)
+	stale := staleLocalsWithPRs(branches, prs, trunkNames(), prsAvailable)
 	if len(stale) == 0 {
 		return nil
 	}
@@ -70,6 +71,26 @@ func pruneStaleBranches(deleteAll bool) error {
 		dropped[s.name] = true
 	}
 	return dropBranchesFromStackFiles(dropped)
+}
+
+// prsFromSnapshot converts the PRSnapshots in snap into the local pullRequest
+// struct that staleLocalsWithPRs consumes. State is uppercased to match the
+// existing convention. Returns (nil, false) when snap or snap.PRs is nil so
+// the caller falls back to the deleted-remotes-only path.
+func prsFromSnapshot(snap *RemoteSnapshot) ([]pullRequest, bool) {
+	if snap == nil || snap.PRs == nil {
+		return nil, false
+	}
+	out := make([]pullRequest, 0, len(snap.PRs))
+	for _, p := range snap.PRs {
+		out = append(out, pullRequest{
+			Number:      p.Number,
+			State:       strings.ToUpper(p.State),
+			BaseRefName: p.Base,
+			HeadRefName: p.Head,
+		})
+	}
+	return out, true
 }
 
 func chooseStaleToDelete(stale []staleBranch, deleteAll bool) ([]staleBranch, error) {

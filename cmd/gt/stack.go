@@ -135,6 +135,31 @@ func locate(st *stackState, branch string) position {
 	return p
 }
 
+func descendantsAfter(s trackedStack, name string) (parent string, descendants []trackedBranch, ok bool) {
+	parent = s.Trunk.Branch
+	for i, b := range s.Branches {
+		if b.Branch == name {
+			return parent, append([]trackedBranch{}, s.Branches[i+1:]...), true
+		}
+		parent = b.Branch
+	}
+	return "", nil, false
+}
+
+func stackContaining(st *stackState, name string) (trackedStack, bool) {
+	if st == nil {
+		return trackedStack{}, false
+	}
+	for _, s := range st.Stacks {
+		for _, b := range s.Branches {
+			if b.Branch == name {
+				return s, true
+			}
+		}
+	}
+	return trackedStack{}, false
+}
+
 func errForked(branch string) error {
 	return fmt.Errorf(
 		"branch %q belongs to more than one stack; gt only supports linear stacks.\n"+

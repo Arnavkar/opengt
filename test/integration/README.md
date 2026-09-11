@@ -1,6 +1,6 @@
 # Integration tests
 
-`gtstack` is a translation layer, and `gh stack` is at v0.1.0. A renamed flag,
+`opengt` is a translation layer, and `gh stack` is at v0.1.0. A renamed flag,
 a changed default, or a moved state file breaks `gt` without changing a line of
 its own code, and the unit tests in `cmd/gt` cannot see any of it.
 
@@ -41,10 +41,10 @@ repository afterwards — branches, commits, rebase results, the state file:
 | Plain Git | commit / rebase / reset on stacked and untracked branches |
 | Reading the stack | `gt log`, `gt ls`, `gt ll`, `gt log --json` |
 | Navigation | `gt up`/`u`, `down`/`d`, `top`/`t`, `bottom`/`b`, `trunk` |
-| Git passthrough | `gt add`, `cherry-pick`, `rebase`, `reset`, `restore` |
+| Git passthrough | `gt add`, `cherry-pick`, `rebase`, `reset`, `restore`, unknown commands → git |
 | Checkout routing | tracked branch, untracked branch, trunk, `-t` |
 | Conflicts | pause detection, `gt continue`, `gt abort` |
-| Refusals | unsupported commands, unknown commands, conflicting flags |
+| Refusals | unsupported Graphite commands, conflicting flags |
 
 `contract_test.go` pins the parts of the `gh stack` interface `gt` depends on:
 
@@ -108,7 +108,7 @@ On failure it opens an issue labelled `gh-stack-compat` with the failing output,
 which GitHub emails to you. A later green run closes it. While an issue is
 already open, further failures are added as comments rather than new issues.
 
-When it goes red, dispatch it again with `v0.1.0` — the version gtstack
+When it goes red, dispatch it again with `v0.1.0` — the version opengt
 targets. If that run is green, the extension changed; if it is red too,
 something in the tests or the runner did.
 

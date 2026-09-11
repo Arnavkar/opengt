@@ -63,7 +63,7 @@ func runTests(m *testing.M) int {
 	// print it whether or not anything fails.
 	fmt.Fprintf(os.Stderr, "integration: testing against %s\n", strings.TrimSpace(string(out)))
 
-	dir, err := os.MkdirTemp("", "gtstack-integration")
+	dir, err := os.MkdirTemp("", "opengt-integration")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "integration:", err)
 		return 1
@@ -114,8 +114,8 @@ func newFixture(t *testing.T) *fixture {
 	}
 	runIn(t, root, "git", "init", "--quiet", "--bare", "--initial-branch=main", f.origin)
 	runIn(t, root, "git", "init", "--quiet", "--initial-branch=main", f.dir)
-	f.git("config", "user.name", "gtstack tests")
-	f.git("config", "user.email", "tests@gtstack.invalid")
+	f.git("config", "user.name", "opengt tests")
+	f.git("config", "user.email", "tests@opengt.invalid")
 	f.git("remote", "add", "origin", f.origin)
 	f.write("trunk.txt", "trunk\n")
 	f.git("add", "-A")

@@ -259,19 +259,19 @@ func currentBranch() (string, error) {
 	return b, nil
 }
 
-// fastForwardTrunk fetches origin and moves the stack trunk (usually main) to
-// match it. Git refuses `branch -f` on a branch another worktree has checked
-// out, so when that happens the fast-forward runs in that worktree instead.
-func fastForwardTrunk() error {
-	if err := fetchStackOrigin(); err != nil {
-		return err
-	}
-	trunk := fallbackTrunk(trunkNames())
-	remote := "origin/" + trunk
+// fastForwardBranch fast-forwards a local branch to match origin/<branch>
+// when origin is ahead and the move is a true fast-forward. It does not
+// fetch; the caller ensures origin/<branch> is current (e.g. via
+// fetchStackOrigin). If the branch is checked out in another worktree the
+// fast-forward runs there as `git -C <wt> merge --ff-only`; otherwise the
+// ref is moved with `git branch --force`. Non-fast-forward situations are
+// left untouched.
+func fastForwardBranch(branch string) error {
+	remote := "origin/" + branch
 	if run2("git", "rev-parse", "--verify", "--quiet", remote) != nil {
 		return nil
 	}
-	local, err := capture("git", "rev-parse", trunk)
+	local, err := capture("git", "rev-parse", branch)
 	if err != nil {
 		return nil
 	}
@@ -282,14 +282,29 @@ func fastForwardTrunk() error {
 	if local == want {
 		return nil
 	}
-	wt, err := worktreePathForBranch(trunk)
+	// Confirm the move is a true fast-forward before touching the ref.
+	if !isAncestor(local, remote) {
+		return nil
+	}
+	wt, err := worktreePathForBranch(branch)
 	if err != nil {
 		return err
 	}
 	if wt == "" {
-		return run("git", "branch", "--force", "--", trunk, remote)
+		return run("git", "branch", "--force", "--", branch, remote)
 	}
 	return run("git", "-C", wt, "merge", "--ff-only", remote)
+}
+
+// fastForwardTrunk is a thin wrapper that fetches origin (targeted, per
+// decision #2) and then fast-forwards the repo's trunk. Existing callers
+// keep working; new code that has already fetched should call
+// fastForwardBranch directly.
+func fastForwardTrunk() error {
+	if err := fetchStackOrigin(); err != nil {
+		return err
+	}
+	return fastForwardBranch(fallbackTrunk(trunkNames()))
 }
 
 // fetchStackOrigin fetches only trunk and stacked branches, then drops

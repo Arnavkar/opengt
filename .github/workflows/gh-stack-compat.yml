@@ -1,10 +1,10 @@
-# gtstack is a translation layer over an extension at v0.1.0, so it can break
+# opengt is a translation layer over an extension at v0.1.0, so it can break
 # without a single line of its own changing. This job answers one question:
 # does gt still work against the gh-stack release you point it at?
 #
 # It runs daily against the latest release. Dispatch it by hand with a tag to
 # test a specific version, or to check whether a failure is new by re-running
-# against the version gtstack targets.
+# against the version opengt targets.
 name: gh-stack compatibility
 
 on:
@@ -67,7 +67,7 @@ jobs:
         run: |
           run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           {
-            echo "\`gh stack\` **$VERSION** no longer matches what gtstack expects."
+            echo "\`gh stack\` **$VERSION** no longer matches what opengt expects."
             echo
             echo "- Run: $run_url"
             echo "- Requested version: \`$VERSION\`"

@@ -165,6 +165,19 @@ func TestPickRowRenderDimsUntracked(t *testing.T) {
 	}
 }
 
+func TestFilterDeleteRowsOmitsTrunkAndGithub(t *testing.T) {
+	rows := []pickRow{
+		{branch: "b", text: "◯  b"},
+		{branch: "a", text: "◯  a"},
+		{branch: "main", trunk: true, text: "◯  main"},
+		githubStacksRow(),
+	}
+	got := filterDeleteRows(rows)
+	if len(got) != 2 || got[0].branch != "b" || got[1].branch != "a" {
+		t.Fatalf("filterDeleteRows = %#v", got)
+	}
+}
+
 func TestKeepExistingRowsDropsGhosts(t *testing.T) {
 	rows := []pickRow{
 		{branch: "ghost"},

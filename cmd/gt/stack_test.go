@@ -92,6 +92,37 @@ func TestLocateForkedAsTrunkOfAnotherStack(t *testing.T) {
 	}
 }
 
+func TestDescendantsAfter(t *testing.T) {
+	st := stateFrom(t, linearStack)
+	s := st.Stacks[0]
+	parent, rest, ok := descendantsAfter(s, "b")
+	if !ok || parent != "a" || len(rest) != 1 || rest[0].Branch != "c" {
+		t.Fatalf("delete b: parent=%q rest=%v ok=%v", parent, rest, ok)
+	}
+	parent, rest, ok = descendantsAfter(s, "a")
+	if !ok || parent != "main" || len(rest) != 2 || rest[0].Branch != "b" || rest[1].Branch != "c" {
+		t.Fatalf("delete a: parent=%q rest=%v ok=%v", parent, rest, ok)
+	}
+	parent, rest, ok = descendantsAfter(s, "c")
+	if !ok || parent != "b" || len(rest) != 0 {
+		t.Fatalf("delete tip: parent=%q rest=%v ok=%v", parent, rest, ok)
+	}
+	if _, _, ok := descendantsAfter(s, "missing"); ok {
+		t.Fatal("missing branch should not be found")
+	}
+}
+
+func TestStackContaining(t *testing.T) {
+	st := stateFrom(t, linearStack)
+	s, ok := stackContaining(st, "b")
+	if !ok || len(s.Branches) != 3 {
+		t.Fatalf("stackContaining b = %#v ok=%v", s, ok)
+	}
+	if _, ok := stackContaining(st, "main"); ok {
+		t.Fatal("trunk is not a stack member")
+	}
+}
+
 func TestLocateNoStacks(t *testing.T) {
 	st := stateFrom(t, `{"schemaVersion": 1}`)
 	if got := locate(st, "main"); got != (position{}) {

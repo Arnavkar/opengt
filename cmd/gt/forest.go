@@ -163,6 +163,21 @@ func checkoutRows(st *stackState, current string) []pickRow {
 	return markUntrackedRows(rows, tracked, trunk)
 }
 
+func deleteRows(st *stackState, current string) []pickRow {
+	return filterDeleteRows(checkoutRows(st, current))
+}
+
+func filterDeleteRows(rows []pickRow) []pickRow {
+	var out []pickRow
+	for _, r := range rows {
+		if r.trunk || r.openGithub {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
 func stackedBranchNames(st *stackState) map[string]bool {
 	m := map[string]bool{}
 	if st == nil {
