@@ -14,7 +14,7 @@ legacy `gh stack` implementation with `--native`.
 
 > [!IMPORTANT]
 > `opengt` is early software. It currently supports **linear stacks only** and
-> targets `gh-stack` **v0.1.0**, state schema **v1**. When an operation cannot
+> targets `gh-stack` **v0.1.1**, state schema **v1**. When an operation cannot
 > be translated safely, it stops with an actionable error instead of guessing.
 
 ## Quick start
@@ -183,12 +183,12 @@ If two worktrees disagree about stack order, `gt` stops and tells you to run
 
 ## Pinning `gh-stack`
 
-This shim targets **v0.1.0** and schema **v1**. CI installs that pin
+This shim targets **v0.1.1** and schema **v1**. CI installs that pin
 (`.github/workflows/ci.yml`). The daily `gh-stack-compat` workflow tests
 `latest` as an early warning; it does not change what developers should run.
 
 ```sh
-gh extension install github/gh-stack --pin v0.1.0 --force
+gh extension install github/gh-stack --pin v0.1.1 --force
 ```
 
 A newer `gh-stack` with the same schema warns and continues. An unknown

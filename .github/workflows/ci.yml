@@ -52,7 +52,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh extension install github/gh-stack --pin v0.1.0 --force
+          gh extension install github/gh-stack --pin v0.1.1 --force
           gh stack --version
 
       - name: go vet

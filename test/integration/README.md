@@ -1,6 +1,6 @@
 # Integration tests
 
-`opengt` is a translation layer, and `gh stack` is at v0.1.0. A renamed flag,
+`opengt` is a translation layer, and `gh stack` is at v0.1.1. A renamed flag,
 a changed default, or a moved state file breaks `gt` without changing a line of
 its own code, and the unit tests in `cmd/gt` cannot see any of it.
 
@@ -80,7 +80,7 @@ real pull requests on every run.
 Also untested: `gh stack switch` and `gh stack modify` open a TUI, and the
 `gh-stack-modify-state` marker `gt` looks for can only be produced through it.
 
-## Known `gh stack` v0.1.0 behaviour
+## Known `gh stack` v0.1.1 behaviour
 
 `gt` reads `gh-stack` from `--git-dir` first (the worktree-local file current
 gh stack writes) and falls back to `--git-common-dir` when that file is
@@ -102,13 +102,13 @@ that cannot be run.
 
 `.github/workflows/gh-stack-compat.yml` installs a `gh-stack` release and runs
 this suite. It runs every day against `latest`, and takes a version as a
-`workflow_dispatch` input — a tag such as `v0.1.0`, or `latest`.
+`workflow_dispatch` input — a tag such as `v0.1.1`, or `latest`.
 
 On failure it opens an issue labelled `gh-stack-compat` with the failing output,
 which GitHub emails to you. A later green run closes it. While an issue is
 already open, further failures are added as comments rather than new issues.
 
-When it goes red, dispatch it again with `v0.1.0` — the version opengt
+When it goes red, dispatch it again with `v0.1.1` — the version opengt
 targets. If that run is green, the extension changed; if it is red too,
 something in the tests or the runner did.
 

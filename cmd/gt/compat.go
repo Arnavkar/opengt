@@ -14,7 +14,7 @@ import (
 // early warning and must not be treated as the version developers run.
 var ghStackCompat = GhStackCompatibility{
 	MinVersion:     Version{0, 1, 0},
-	TestedVersion:  Version{0, 1, 0},
+	TestedVersion:  Version{0, 1, 1},
 	SchemaVersions: []int{1},
 	StateFileName:  "gh-stack",
 }
