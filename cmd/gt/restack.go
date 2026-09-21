@@ -55,6 +55,27 @@ func planRestack(
 	return actions
 }
 
+// stackParents maps each branch to the ref it must sit on: the previous
+// branch in the stack, or — for the bottom branch — the trunk. The trunk
+// wins over the branch's cached Base: that Base is the trunk SHA recorded
+// when the stack was written, which stays an ancestor of the branch even
+// after the trunk has moved, so rebasing onto it can never pull in new
+// trunk commits. An empty trunk falls back to the cached Base.
+func stackParents(stack []trackedBranch, trunk string) map[string]string {
+	parents := make(map[string]string, len(stack))
+	for i, b := range stack {
+		if i == 0 {
+			parents[b.Branch] = trunk
+			if parents[b.Branch] == "" {
+				parents[b.Branch] = b.Base
+			}
+		} else {
+			parents[b.Branch] = stack[i-1].Branch
+		}
+	}
+	return parents
+}
+
 // CascadeRestack rebases each branch onto its parent in stack order, returning
 // one RestackResult per branch and a Rollback usable to recover local refs on
 // conflict. Zero GitHub API calls happen here. Branches checked out in other
@@ -79,14 +100,7 @@ func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *
 		heads[b.Branch] = sha
 	}
 
-	parents := make(map[string]string, len(stack))
-	for i, b := range stack {
-		if i == 0 {
-			parents[b.Branch] = b.Base
-		} else {
-			parents[b.Branch] = stack[i-1].Branch
-		}
-	}
+	parents := stackParents(stack, opts.Trunk)
 
 	ancestor := make(map[string]bool, len(stack))
 	worktree := make(map[string]string, len(stack))
@@ -112,7 +126,17 @@ func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *
 			continue
 		}
 
-		if !act.Rebase {
+		// planRestack decided from ancestry captured before any branch moved.
+		// An ancestor rebased earlier in this cascade invalidates that
+		// decision (the parent's old SHA was an ancestor; its new head is
+		// not), so the live refs are authoritative unless Force says
+		// rebase regardless.
+		rebase := act.Rebase
+		if !opts.Force {
+			rebase = !isAncestor(act.Parent, act.Branch)
+		}
+
+		if !rebase {
 			res.NewSHA = res.OldSHA
 			results = append(results, res)
 			continue

@@ -491,7 +491,6 @@ func repairMetadata(repo repoStackState, yes, quiet bool) (applied, skipped []st
 			plans = append(plans, repairPlan{path: src.Path, state: st, notes: notes})
 		}
 	}
-	plans = append(plans, missingWorktreeCopies(repo)...)
 	if len(plans) == 0 {
 		return nil, nil
 	}
@@ -572,43 +571,6 @@ func applySafeRepairs(st *stackState, repo repoStackState, src stackStateSource)
 		}
 	}
 	return changed, uniqueStrings(notes)
-}
-
-func missingWorktreeCopies(repo repoStackState) []repairPlan {
-	var plans []repairPlan
-	locs, err := listStackLocations()
-	if err != nil {
-		return nil
-	}
-	authoritative := []trackedStack{}
-	for _, s := range repo.Stacks {
-		if !s.Stale {
-			authoritative = append(authoritative, s.trackedStack)
-		}
-	}
-	if len(authoritative) == 0 {
-		return nil
-	}
-	for _, loc := range locs {
-		if loc.WorktreePath == "" {
-			continue
-		}
-		st, err := readStackFile(loc.StackFile)
-		empty := os.IsNotExist(err) || (err == nil && st != nil && len(st.Stacks) == 0)
-		if !empty {
-			continue
-		}
-		out := &stackState{SchemaVersion: ghStackCompat.PrimarySchema(), Stacks: append([]trackedStack{}, authoritative...)}
-		if st != nil {
-			out.Repository = st.Repository
-		}
-		plans = append(plans, repairPlan{
-			path:  loc.StackFile,
-			state: out,
-			notes: []string{"copy authoritative stacks into " + loc.WorktreePath},
-		})
-	}
-	return plans
 }
 
 func hasError(issues []stackIssue) bool {

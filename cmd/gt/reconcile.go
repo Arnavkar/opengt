@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 )
 
@@ -452,18 +451,6 @@ func loadState() (*stackState, error) {
 
 func loadForestState() (*stackState, error) { return loadState() }
 
-func loadCurrentWorktreeState() (*stackState, error) {
-	gitDir, err := capture("git", "rev-parse", "--path-format=absolute", "--git-dir")
-	if err != nil {
-		return nil, fmt.Errorf("not a git repository")
-	}
-	st, err := readStackFile(filepath.Join(gitDir, ghStackCompat.StateFileName))
-	if os.IsNotExist(err) {
-		return &stackState{SchemaVersion: ghStackCompat.PrimarySchema()}, nil
-	}
-	return st, err
-}
-
 func errAmbiguous(branch string, hits []resolvedStack) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "branch %q is claimed by two incompatible stack definitions\n", branch)
@@ -473,13 +460,6 @@ func errAmbiguous(branch string, hits []resolvedStack) error {
 	}
 	fmt.Fprintf(&b, "\n\nRun:\n  gt doctor\n\nNo changes were made.")
 	return fmt.Errorf("%s", b.String())
-}
-
-func errMissingWorktreeState(branch, source string) error {
-	return fmt.Errorf(
-		"this worktree is missing gh-stack metadata for %q (tracked in %s).\n"+
-			"    Run `gt doctor --repair` to copy it.\n"+
-			"    No changes were made.", branch, source)
 }
 
 func requireStackPosition(branch string) (position, *stackState, error) {
@@ -496,27 +476,4 @@ func requireStackPosition(branch string) (position, *stackState, error) {
 		return pos, st, errForked(branch)
 	}
 	return pos, st, nil
-}
-
-func requireLocalStackMetadata(branch string, pos position) error {
-	if !pos.inStack {
-		return nil
-	}
-	cur, err := loadCurrentWorktreeState()
-	if err != nil {
-		return err
-	}
-	if locate(cur, branch).inStack {
-		return nil
-	}
-	src := "another worktree"
-	if repo, err := loadRepoStacks(); err == nil {
-		for _, s := range repo.Stacks {
-			if locate(&stackState{Stacks: []trackedStack{s.trackedStack}}, branch).inStack && len(s.Sources) > 0 {
-				src = s.Sources[0]
-				break
-			}
-		}
-	}
-	return errMissingWorktreeState(branch, src)
 }

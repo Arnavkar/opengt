@@ -51,9 +51,6 @@ func cmdCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := requireLocalStackMetadata(branch, pos); err != nil {
-		return err
-	}
 
 	if pos.inStack && !pos.atTop {
 		return fmt.Errorf(
@@ -119,9 +116,6 @@ func cmdModify(args []string) error {
 	}
 	pos, _, err := requireStackPosition(branch)
 	if err != nil {
-		return err
-	}
-	if err := requireLocalStackMetadata(branch, pos); err != nil {
 		return err
 	}
 	if !pos.inStack {
@@ -409,7 +403,7 @@ func restackForSubmit(repo *repoStackState, current string, force bool) (bool, e
 	if !ok {
 		return false, nil
 	}
-	results, _, err := CascadeRestack(stack.Branches, RestackOpts{Force: force})
+	results, _, err := CascadeRestack(stack.Branches, RestackOpts{Force: force, Trunk: stack.Trunk.Branch})
 	if err != nil {
 		return false, err
 	}
@@ -640,17 +634,12 @@ func cmdSync(args []string) error {
 
 	plan := BuildSyncPlan(repo, snap)
 
-	moved, err := executeSyncPlan(plan, snap, *noRestack, *force)
-	if err != nil {
-		return err
-	}
-	if moved {
-		if err := persistSyncState(repo); err != nil {
-			return err
-		}
-	}
-
-	return pruneStaleBranches(snap, *deleteAll)
+	// executeSyncPlan runs the whole sync flow in order: fast-forward the
+	// trunk and behind branches, prune merged/closed/gone stack branches
+	// (rebasing what was above them onto the trunk), cascade-restack every
+	// stack against the updated trunk, and persist the refreshed state.
+	_, err = executeSyncPlan(plan, snap, *noRestack, *force, *deleteAll)
+	return err
 }
 
 // ignorableStackSyncError reports whether a stderr from a stack rebase is
@@ -707,7 +696,49 @@ func buildKnownPRs(repo *repoStackState) map[string]int {
 // and cascade restacks. It returns moved=true when any local ref changed, so
 // the caller can persist stack state once. No remote mutations happen here;
 // a restack conflict aborts with the error before any push.
-func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, noRestack bool, force bool) (bool, error) {
+func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, noRestack bool, force bool, deleteAll bool) (bool, error) {
+	moved, err := fastForwardSyncBranches(plan, snap)
+	if err != nil {
+		return moved, err
+	}
+
+	pruned, err := pruneStaleBranches(snap, deleteAll)
+	if err != nil {
+		return moved, err
+	}
+
+	// Prune rewrites the stack chains (it deletes merged branches and rebases
+	// what was above them onto the trunk), so the restack must run against
+	// the updated chains, not the pre-prune plan.
+	var restacked bool
+	if !noRestack {
+		repo, err := loadRepoStacks()
+		if err != nil {
+			return moved, err
+		}
+		restacked, err = restackSyncStacks(repo, force)
+		if err != nil {
+			return moved, err
+		}
+	}
+
+	if moved || restacked || pruned {
+		repo, err := loadRepoStacks()
+		if err != nil {
+			return moved, err
+		}
+		refreshStackSHAs(repo)
+		if err := persistSyncState(repo); err != nil {
+			return moved, err
+		}
+	}
+	return moved || restacked || pruned, nil
+}
+
+// fastForwardSyncBranches fetches when anything is behind, then fast-forwards
+// the trunk and any stack branches strictly behind their remote. It returns
+// moved=true when a local ref changed.
+func fastForwardSyncBranches(plan SyncPlan, snap *RemoteSnapshot) (bool, error) {
 	// The plan derives the trunk from repo stacks; when none is tracked it
 	// cannot, so resolve the effective trunk here (executor may touch git).
 	// The snapshot always carries it because collectSyncBranches adds the
@@ -755,21 +786,29 @@ func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, noRestack bool, force 
 		}
 	}
 
-	for i, sp := range plan.Stacks {
+	for i := range plan.Stacks {
 		for _, branch := range behindByStack[i] {
 			if err := fastForwardBranch(branch); err != nil {
 				return moved, err
 			}
 		}
+	}
+	return moved, nil
+}
 
-		if noRestack {
+// restackSyncStacks cascade-restacks every tracked stack against its trunk,
+// skipping stacks whose branches are all checked out in other worktrees. It
+// returns moved=true when any local ref changed.
+func restackSyncStacks(repo *repoStackState, force bool) (bool, error) {
+	var moved bool
+	for _, s := range repo.Stacks {
+		if stackAllInOtherWorktrees(s.trackedStack) {
 			continue
 		}
-		if stackAllInOtherWorktrees(sp.Stack) {
-			continue
-		}
-
-		results, _, err := CascadeRestack(sp.Stack.Branches, RestackOpts{Force: force})
+		results, _, err := CascadeRestack(s.trackedStack.Branches, RestackOpts{
+			Force: force,
+			Trunk: s.trackedStack.Trunk.Branch,
+		})
 		if err != nil {
 			return moved, err
 		}
@@ -780,6 +819,32 @@ func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, noRestack bool, force 
 		}
 	}
 	return moved, nil
+}
+
+// refreshStackSHAs updates the cached head/base SHAs in the repo state from
+// the live refs, so the persisted gh-stack state matches the repository after
+// sync moved things. base records the parent's head (the trunk head for the
+// bottom branch), matching what gh-stack itself writes. Best effort: a
+// missing ref leaves its cached value alone.
+func refreshStackSHAs(repo *repoStackState) {
+	for i := range repo.Stacks {
+		s := &repo.Stacks[i].trackedStack
+		if h, err := branchHead(s.Trunk.Branch); err == nil {
+			s.Trunk.Head = h
+		}
+		for j := range s.Branches {
+			parent := s.Trunk.Branch
+			if j > 0 {
+				parent = s.Branches[j-1].Branch
+			}
+			if h, err := branchHead(s.Branches[j].Branch); err == nil {
+				s.Branches[j].Head = h
+			}
+			if h, err := branchHead(parent); err == nil {
+				s.Branches[j].Base = h
+			}
+		}
+	}
 }
 
 // branchesBehindRemote returns the members of a stack whose tracked Head
@@ -940,13 +1005,6 @@ func checkoutTarget(target string) error {
 			return err
 		}
 		if !pos.inStack {
-			return run("git", "checkout", target)
-		}
-		cur, err := loadCurrentWorktreeState()
-		if err != nil {
-			return err
-		}
-		if !locate(cur, target).inStack {
 			return run("git", "checkout", target)
 		}
 	}

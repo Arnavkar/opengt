@@ -163,10 +163,9 @@ gt doctor --repair --yes
 ```
 
 `--yes` applies only repairs classified as safe (refresh cached SHAs, drop
-duplicate identical stacks, copy authoritative state into a worktree that is
-missing it). It never resolves conflicting stack definitions or rewrites Git
-history. Prefix disagreements are ambiguous and are never resolved by `--yes`;
-use `gh stack modify` to choose the intended stack.
+duplicate identical stacks). It never resolves conflicting stack definitions or
+rewrites Git history. Prefix disagreements are ambiguous and are never resolved
+by `--yes`; use `gh stack modify` to choose the intended stack.
 
 Exit codes:
 
@@ -178,8 +177,14 @@ Exit codes:
 | 3 | ambiguous/unsafe state; do not guess |
 | 4 | missing git/`gh`/`gh-stack`, GitHub API failure, or an unsupported state schema |
 
-If two worktrees disagree about stack order, `gt` stops and tells you to run
-`gt doctor`. No changes are made.
+### One state file, at the repo root
+
+`gt` reads and writes gh-stack state only at the shared repository directory
+(`.git/gh-stack`), never per worktree. Every worktree sees and updates the same
+file, so sync from one worktree is visible everywhere and worktrees cannot
+disagree about stack order. `gh stack` itself may still write a per-worktree
+copy under `.git/worktrees/<name>` when its own commands run in a linked
+worktree; `gt` deliberately ignores those copies.
 
 ## Pinning `gh-stack`
 
@@ -381,11 +386,10 @@ In a non-interactive environment it never installs software automatically; it
 prints the installation command and exits instead.
 
 To decide whether `gt create` should initialize or extend a stack, `opengt`
-reads every `.git/gh-stack` file in the repository (the current worktree git
-dir, the shared repository, and linked worktrees). Identical copies are
-deduplicated; incompatible orders are reported rather than merged. It refuses
-to run against an unknown schema version so that a future `gh-stack` update
-cannot silently corrupt a stack.
+reads the repository's single `.git/gh-stack` state file at the repo root (the
+shared git directory; see [One state file](#one-state-file-at-the-repo-root)).
+It refuses to run against an unknown schema version so that a future
+`gh-stack` update cannot silently corrupt a stack.
 
 [gh-cli]: https://cli.github.com/
 [gh-stack]: https://github.com/github/gh-stack

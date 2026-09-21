@@ -3,6 +3,8 @@
 package integration
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -712,6 +714,51 @@ func TestLinkedWorktree(t *testing.T) {
 	}
 }
 
+// TestLinkedWorktreeSharesRepoRootState: gt reads and writes gh-stack state
+// only at the repo root (the shared git dir). Commands run from a linked
+// worktree must see and update that one file, must not create their own copy
+// under .git/worktrees/<name>, and must ignore per-worktree copies that
+// `gh stack` itself may have planted there.
+func TestLinkedWorktreeSharesRepoRootState(t *testing.T) {
+	f := newFixture(t)
+	f.layer("layer-one", "Add layer one")
+	f.layer("layer-two", "Add layer two")
+	for _, b := range []string{"layer-one", "layer-two"} {
+		f.git("push", "--quiet", "-u", "origin", b)
+	}
+	// Merge layer-one into the trunk and drop its remote branch, as GitHub
+	// does after a merge with branch auto-deletion.
+	f.git("checkout", "--quiet", "main")
+	f.git("merge", "--no-ff", "--quiet", "-m", "Merge layer-one", "layer-one")
+	f.git("push", "--quiet", "origin", "main")
+	f.git("push", "--quiet", "origin", "--delete", "layer-one")
+
+	linked := f.dir + "-worktree"
+	f.git("worktree", "add", "--quiet", linked, "layer-two")
+	worktree := &fixture{t: t, dir: linked, origin: f.origin}
+
+	// A sync (with prune) run from the worktree updates the repo-root file.
+	worktree.gt("sync", "-d")
+	if f.git("branch", "--list", "layer-one") != "" {
+		t.Error("sync -d from the worktree did not delete the stale branch")
+	}
+	if got := f.tracked(); len(got) != 1 || got[0] != "layer-two" {
+		t.Errorf("repo-root state tracks %v after worktree sync -d, want [layer-two]", got)
+	}
+
+	// A per-worktree state file (which gh stack writes when its own commands
+	// run in a linked worktree) must not leak into gt's view of the stacks.
+	plant := linked + "-planted"
+	f.git("worktree", "add", "--quiet", "--detach", plant, "main")
+	os.WriteFile(filepath.Join(f.dir, ".git", "worktrees", filepath.Base(plant), "gh-stack"),
+		[]byte(`{"schemaVersion":1,"stacks":[{"trunk":{"branch":"main"},"branches":[{"branch":"bogus"}]}]}`+"\n"),
+		0o644)
+	worktree.gt("sync")
+	if got := f.tracked(); len(got) != 1 || got[0] != "layer-two" {
+		t.Errorf("per-worktree state leaked into gt's view: %v, want [layer-two]", got)
+	}
+}
+
 // skipNoGitHub is defined in bench_test.go; the submit tests below reuse it to
 // gate on a real GitHub remote + token.
 
@@ -768,6 +815,94 @@ func TestSyncFastForwardsTrunk(t *testing.T) {
 
 	if got, want := f.git("rev-parse", "main"), f.git("rev-parse", "origin/main"); got != want {
 		t.Errorf("main was not fast-forwarded: local %s, origin %s", got, want)
+	}
+}
+
+// TestSyncRestacksOntoMovedTrunk: after sync fast-forwards the trunk, every
+// stack must land on the new trunk head. The stack's cached base is the trunk
+// SHA from when it was created, which stays an ancestor forever, so the
+// restack must target the trunk branch itself, not that snapshot.
+func TestSyncRestacksOntoMovedTrunk(t *testing.T) {
+	f := newFixture(t)
+	f.layer("layer-one", "Add layer one")
+	f.layer("layer-two", "Add layer two")
+	for _, b := range []string{"layer-one", "layer-two"} {
+		f.git("push", "--quiet", "-u", "origin", b)
+	}
+
+	f.git("checkout", "--quiet", "main")
+	f.write("trunk-moves.txt", "moved\n")
+	f.git("add", "-A")
+	f.git("commit", "--quiet", "-m", "Trunk moves on")
+	f.git("push", "--quiet", "origin", "main")
+	f.git("reset", "--hard", "--quiet", "HEAD~1")
+	f.git("checkout", "--quiet", "layer-two")
+
+	f.gt("sync")
+
+	if got, want := f.git("rev-parse", "main"), f.git("rev-parse", "origin/main"); got != want {
+		t.Errorf("main was not fast-forwarded: local %s, origin %s", got, want)
+	}
+	if got := f.git("rev-parse", "layer-one^"); got != f.git("rev-parse", "main") {
+		t.Errorf("layer-one was not rebased onto the moved trunk (parent %s)\n%s",
+			got, f.git("log", "--graph", "--oneline", "--all"))
+	}
+	if got := f.git("rev-parse", "layer-two^"); got != f.git("rev-parse", "layer-one") {
+		t.Errorf("layer-two was not carried along (parent %s)\n%s",
+			got, f.git("log", "--graph", "--oneline", "--all"))
+	}
+	if f.commitsIn("main..layer-one") != 1 || f.commitsIn("layer-one..layer-two") != 1 {
+		t.Errorf("restack duplicated or dropped commits:\n%s", f.git("log", "--graph", "--oneline", "--all"))
+	}
+}
+
+// TestSyncPrunesMergedBranchAndRebasesOntoTrunk: when a stack branch's PR has
+// landed (here simulated by merging it into main and deleting the remote
+// branch) and -d clears it, the branches above it must be rebased onto the
+// trunk with the deleted branch's commits dropped — not left stranded on a
+// deleted ref the way `git branch -D` alone would leave them.
+func TestSyncPrunesMergedBranchAndRebasesOntoTrunk(t *testing.T) {
+	f := newFixture(t)
+	f.layer("layer-one", "Add layer one")
+	f.layer("layer-two", "Add layer two")
+	for _, b := range []string{"layer-one", "layer-two"} {
+		f.git("push", "--quiet", "-u", "origin", b)
+	}
+
+	// Merge layer-one into the trunk and drop its remote branch, as GitHub
+	// does after a merge with branch auto-deletion.
+	f.git("checkout", "--quiet", "main")
+	f.git("merge", "--no-ff", "--quiet", "-m", "Merge layer-one", "layer-one")
+	f.git("push", "--quiet", "origin", "main")
+	f.git("push", "--quiet", "origin", "--delete", "layer-one")
+	f.git("checkout", "--quiet", "layer-two")
+
+	f.gt("sync", "-d")
+
+	if f.git("branch", "--list", "layer-one") != "" {
+		t.Fatal("stale stack branch layer-one still exists after gt sync -d")
+	}
+	if got := f.git("rev-parse", "layer-two^"); got != f.git("rev-parse", "main") {
+		t.Errorf("layer-two was not rebased onto the trunk (parent %s, main %s)\n%s",
+			got, f.git("rev-parse", "main"), f.git("log", "--graph", "--oneline", "--all"))
+	}
+	if n := f.commitsIn("main..layer-two"); n != 1 {
+		t.Errorf("layer-two carries %d commits above main, want 1 (the deleted branch's commit must be dropped):\n%s",
+			n, f.git("log", "--graph", "--oneline", "--all"))
+	}
+	if got := f.tracked(); len(got) != 1 || got[0] != "layer-two" {
+		t.Errorf("stack state still tracks %v, want [layer-two]", got)
+	}
+	// The persisted state must describe the repository as it now is: the
+	// surviving branch hangs off the trunk head, not the deleted branch's
+	// SHA, and the trunk head is current.
+	st := f.state()
+	mainSHA := f.git("rev-parse", "main")
+	if st.Stacks[0].Branches[0].Base != mainSHA {
+		t.Errorf("persisted base for layer-two = %s, want the trunk head %s", st.Stacks[0].Branches[0].Base, mainSHA)
+	}
+	if st.Stacks[0].Trunk.Head != mainSHA {
+		t.Errorf("persisted trunk head = %s, want %s", st.Stacks[0].Trunk.Head, mainSHA)
 	}
 }
 

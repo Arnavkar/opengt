@@ -165,7 +165,8 @@ func TestWorktreeStackDiscoveryAndConflicts(t *testing.T) {
 		t.Fatalf("doctor from linked worktree exited %d (%v)\n%s", r.code, issueCodes(payload), r.output())
 	}
 
-	// Conflicting order in the worktree-local file.
+	// A conflicting order in a per-worktree state file must be ignored: gt
+	// reads only the repo-root file, so the worktree cannot poison the view.
 	conflict := []byte(`{
   "schemaVersion": 1,
   "stacks": [{
@@ -179,11 +180,15 @@ func TestWorktreeStackDiscoveryAndConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	payload, r = doctorJSON(t, worktree)
-	if r.code != 3 {
-		t.Fatalf("conflicting stacks exited %d, want 3 (%v)\n%s", r.code, issueCodes(payload), r.output())
+	if r.code > 1 {
+		t.Fatalf("doctor treated a per-worktree state file as authoritative: exited %d (%v)\n%s",
+			r.code, issueCodes(payload), r.output())
 	}
-	if !hasCode(payload, "CONFLICTING_STACK") && !hasCode(payload, "AMBIGUOUS_MEMBERSHIP") {
-		t.Fatalf("expected conflict issue, got %v", issueCodes(payload))
+	if hasCode(payload, "CONFLICTING_STACK") || hasCode(payload, "AMBIGUOUS_MEMBERSHIP") {
+		t.Fatalf("per-worktree state leaked into the reconciled view: %v", issueCodes(payload))
+	}
+	if got := worktree.tracked(); len(got) != 2 || got[0] != "layer-one" || got[1] != "layer-two" {
+		t.Errorf("stack order from the worktree = %v, want the repo-root order [layer-one layer-two]", got)
 	}
 
 	f.git("checkout", "--quiet", "-b", "unrelated-old")
@@ -195,7 +200,7 @@ func TestWorktreeStackDiscoveryAndConflicts(t *testing.T) {
 	f.git("push", "origin", "--delete", "unrelated-old")
 	f.gt("sync", "-d")
 	if f.git("branch", "--list", "unrelated-old") == "" {
-		t.Fatal("sync -d deleted an untracked branch during a stack conflict")
+		t.Fatal("sync -d deleted an untracked branch")
 	}
 }
 
@@ -220,30 +225,5 @@ func TestUnrelatedBranchUntouched(t *testing.T) {
 	}
 	if got := f.subject("sidecar"); got != "sidecar" {
 		t.Errorf("sidecar commit rewritten to %q", got)
-	}
-}
-
-func TestDoctorRepairCopiesStateIntoEmptyWorktree(t *testing.T) {
-	f := newFixture(t)
-	f.layer("layer-one", "Add layer one")
-	f.gt("trunk")
-	linked := f.dir + "-worktree"
-	f.git("worktree", "add", "--quiet", linked, "layer-one")
-	worktree := &fixture{t: t, dir: linked, origin: f.origin}
-
-	gitDir := worktree.git("rev-parse", "--path-format=absolute", "--git-dir")
-	os.Remove(filepath.Join(gitDir, "gh-stack"))
-
-	r := worktree.run(gtBin, "modify", "-a", "-m", "should refuse")
-	if r.code == 0 {
-		t.Fatalf("modify succeeded without worktree metadata:\n%s", r.output())
-	}
-	if !strings.Contains(r.stderr, "gt doctor --repair") {
-		t.Errorf("missing-metadata error is not actionable:\n%s", r.output())
-	}
-
-	rep := worktree.run(gtBin, "doctor", "--repair", "--yes")
-	if _, err := os.Stat(filepath.Join(gitDir, "gh-stack")); err != nil {
-		t.Fatalf("repair did not copy gh-stack: %v\n%s", err, rep.output())
 	}
 }

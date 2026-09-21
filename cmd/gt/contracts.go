@@ -144,10 +144,14 @@ type Rollback struct {
 	OriginalHEAD string
 }
 
-// RestackOpts toggles force and interactive rebases.
+// RestackOpts toggles force and interactive rebases. Trunk names the stack's
+// trunk branch: when set, the bottom branch is rebased onto it (a live ref
+// that follows the moved trunk) instead of its cached base SHA, which is a
+// snapshot of the trunk from when the stack was written.
 type RestackOpts struct {
 	Force       bool
 	Interactive bool
+	Trunk       string
 }
 
 // CascadeRestack rebases each branch onto its parent in stack order, returning

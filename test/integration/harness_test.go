@@ -227,10 +227,8 @@ func (f *fixture) gitFileExists(name string) bool {
 
 func (f *fixture) stackDir() string {
 	f.t.Helper()
-	gitDir := f.git("rev-parse", "--path-format=absolute", "--git-dir")
-	if _, err := os.Stat(filepath.Join(gitDir, "gh-stack")); err == nil {
-		return gitDir
-	}
+	// gt reads and writes gh-stack state only at the repo root (the shared
+	// git dir), no matter which worktree it runs from.
 	return f.git("rev-parse", "--path-format=absolute", "--git-common-dir")
 }
 
@@ -242,9 +240,12 @@ type stackState struct {
 	Stacks        []struct {
 		Trunk struct {
 			Branch string `json:"branch"`
+			Head   string `json:"head"`
 		} `json:"trunk"`
 		Branches []struct {
 			Branch string `json:"branch"`
+			Base   string `json:"base"`
+			Head   string `json:"head"`
 		} `json:"branches"`
 	} `json:"stacks"`
 }

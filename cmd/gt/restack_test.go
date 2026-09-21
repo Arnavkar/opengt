@@ -151,6 +151,32 @@ func TestPlanRestack_ParentsForStackOrder(t *testing.T) {
 	}
 }
 
+// TestStackParents_TrunkOverridesCachedBase pins the sync restack fix: the
+// bottom branch's rebase target is the trunk branch (whose head follows the
+// moved trunk), not the base SHA cached when the stack was written.
+func TestStackParents_TrunkOverridesCachedBase(t *testing.T) {
+	stack := []trackedBranch{
+		{Branch: "a", Base: "stale-trunk-sha"},
+		{Branch: "b", Base: "sha-a"},
+	}
+	parents := stackParents(stack, "main")
+	if parents["a"] != "main" {
+		t.Errorf("a: parent = %q, want the trunk branch main", parents["a"])
+	}
+	if parents["b"] != "a" {
+		t.Errorf("b: parent = %q, want a", parents["b"])
+	}
+}
+
+// TestStackParents_FallsBackToCachedBase: without a trunk name the bottom
+// branch keeps its cached base.
+func TestStackParents_FallsBackToCachedBase(t *testing.T) {
+	stack := []trackedBranch{{Branch: "a", Base: "trunk-sha"}}
+	if got := stackParents(stack, "")["a"]; got != "trunk-sha" {
+		t.Errorf("a: parent = %q, want cached trunk-sha", got)
+	}
+}
+
 func TestRollback_CapturesPreRestackRefs(t *testing.T) {
 	rb := Rollback{
 		OriginalHEAD: "feature",

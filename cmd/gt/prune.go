@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -33,10 +34,15 @@ type staleBranch struct {
 // stacked remotes and dropped missing origin refs, so "gone" is visible. PR
 // state is consumed from snap (loaded once by LoadRemoteSnapshot) rather than
 // a fresh `gh pr list` shell-out.
-func pruneStaleBranches(snap *RemoteSnapshot, deleteAll bool) error {
+//
+// Each confirmed deletion rebases the branches above the deleted one onto its
+// parent (the trunk for the bottom branch, dropping the deleted branch's
+// commits) before removing it — the same machinery as `gt delete`. It returns
+// true when anything was deleted or cleaned from the stack state.
+func pruneStaleBranches(snap *RemoteSnapshot, deleteAll bool) (bool, error) {
 	branches, err := listStaleCandidates()
 	if err != nil {
-		return err
+		return false, err
 	}
 	prs, prsAvailable := prsFromSnapshot(snap)
 	if !prsAvailable {
@@ -44,33 +50,65 @@ func pruneStaleBranches(snap *RemoteSnapshot, deleteAll bool) error {
 	}
 	stale := staleLocalsWithPRs(branches, prs, trunkNames(), prsAvailable)
 	if len(stale) == 0 {
-		return nil
+		return false, nil
 	}
 
 	chosen, err := chooseStaleToDelete(stale, deleteAll)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	current, err := currentBranch()
-	if err != nil {
-		current = ""
+	if err := validatePaused(); err != nil {
+		fmt.Fprintf(os.Stderr, "gt: skipping stale branch cleanup: %v\n", err)
+		return false, nil
 	}
-	fallback := fallbackTrunk(trunkNames())
-	dropped := map[string]bool{}
-	for _, s := range chosen {
-		if isLocalBranch(s.name) {
-			if err := deleteLocalBranch(s.name, current, fallback); err != nil {
-				fmt.Fprintf(os.Stderr, "gt: could not delete %s: %v\n", s.name, err)
-				continue
+
+	changed := false
+	names := make([]string, len(chosen))
+	for i, s := range chosen {
+		names[i] = s.name
+	}
+	for _, name := range orderForDeletion(names) {
+		if !isLocalBranch(name) {
+			// A state entry with no local branch: clean the state only.
+			if err := dropBranchesFromStackFiles(map[string]bool{name: true}); err == nil {
+				changed = true
 			}
-			if s.name == current {
-				current = fallback
-			}
+			continue
 		}
-		dropped[s.name] = true
+		if err := deleteBranch(name); err != nil {
+			fmt.Fprintf(os.Stderr, "gt: could not delete %s: %v\n", name, err)
+			continue
+		}
+		changed = true
 	}
-	return dropBranchesFromStackFiles(dropped)
+	return changed, nil
+}
+
+// orderForDeletion sorts branches bottom-up within their stack, so a branch
+// is deleted (and its upstack rebased) before the branches above it. Branches
+// from different stacks are independent, so only relative order within a
+// stack matters; untracked names keep a stable position at the end.
+func orderForDeletion(names []string) []string {
+	st, err := loadForestState()
+	if err != nil {
+		return names
+	}
+	depth := map[string]int{}
+	for _, s := range st.Stacks {
+		for i, b := range s.Branches {
+			depth[b.Branch] = i
+		}
+	}
+	return sortByStackDepth(names, depth)
+}
+
+// sortByStackDepth is the pure core of orderForDeletion: a stable sort by
+// stack position (bottom first).
+func sortByStackDepth(names []string, depth map[string]int) []string {
+	out := append([]string(nil), names...)
+	sort.SliceStable(out, func(i, j int) bool { return depth[out[i]] < depth[out[j]] })
+	return out
 }
 
 // prsFromSnapshot converts the PRSnapshots in snap into the local pullRequest

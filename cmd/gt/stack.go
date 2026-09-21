@@ -167,16 +167,35 @@ func errForked(branch string) error {
 }
 
 // pausedOperation reports which gh stack operation, if any, is halted waiting
-// for conflict resolution. gh stack drops a marker file per operation.
+// for conflict resolution. gh stack drops a marker file per operation. Unlike
+// the stack state, markers follow gh stack's per-git-dir rule, so both this
+// worktree's git-dir and the shared repository directory are checked.
 func pausedOperation() (string, error) {
-	dir, err := gitStackDir()
+	dirs, err := pausedMarkerDirs()
 	if err != nil {
 		return "", fmt.Errorf("not a git repository")
 	}
-	for _, op := range []string{"rebase", "modify"} {
-		if _, err := os.Stat(filepath.Join(dir, "gh-stack-"+op+"-state")); err == nil {
-			return op, nil
+	for _, dir := range dirs {
+		for _, op := range []string{"rebase", "modify"} {
+			if _, err := os.Stat(filepath.Join(dir, "gh-stack-"+op+"-state")); err == nil {
+				return op, nil
+			}
 		}
 	}
 	return "", nil
+}
+
+// pausedMarkerDirs lists the git-dirs a paused-operation marker may live in:
+// this worktree's git-dir first, then the shared repository directory.
+func pausedMarkerDirs() ([]string, error) {
+	var dirs []string
+	gitDir, err := capture("git", "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return nil, err
+	}
+	dirs = append(dirs, gitDir)
+	if common, err := capture("git", "rev-parse", "--path-format=absolute", "--git-common-dir"); err == nil && common != gitDir {
+		dirs = append(dirs, common)
+	}
+	return dirs, nil
 }

@@ -418,23 +418,17 @@ func parseWorktreeBranchPaths(out string) map[string]string {
 	return m
 }
 
-// gitStackDir is the directory that holds this checkout's `gh-stack` state file.
+// gitStackDir is the directory gt reads and writes the `gh-stack` state file
+// from: the shared repository directory (`--git-common-dir`), i.e. the repo
+// root. One file, shared by every worktree.
 //
-// Current gh stack writes that file next to `--git-dir`, which in a linked
-// worktree is `.git/worktrees/<name>` rather than the shared repository.
-// Reading `--git-common-dir` instead finds the main checkout's file (often
-// empty) and reports every worktree branch as untracked.
-//
-// If this checkout has no file of its own yet, fall back to the common dir so
-// a stack created in the main repository is still visible from a new worktree.
+// gh stack itself resolves the state path per git-dir, so a command run in a
+// linked worktree can create `.git/worktrees/<name>/gh-stack`. gt ignores
+// those per-worktree copies on purpose: unioning them is what produced
+// cross-worktree surprises (duplicated stacks, conflicting definitions, state
+// copied between worktrees). The repo-root file is the single source of
+// truth.
 func gitStackDir() (string, error) {
-	gitDir, err := capture("git", "rev-parse", "--path-format=absolute", "--git-dir")
-	if err != nil {
-		return "", err
-	}
-	if _, err := os.Stat(filepath.Join(gitDir, ghStackCompat.StateFileName)); err == nil {
-		return gitDir, nil
-	}
 	return capture("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
 }
 
@@ -456,43 +450,20 @@ func gitStackFiles() ([]string, error) {
 	return files, nil
 }
 
-// listStackLocations is every git-dir that might hold a gh-stack file: this
-// checkout, the shared repository, and each linked worktree. gh stack writes
-// per git-dir, so a worktree only sees its own stacks unless we union them.
+// listStackLocations is every git-dir gt reads gh-stack state from: only the
+// shared repository directory. Per-worktree state files (which gh stack may
+// write when a command runs in a linked worktree) are deliberately not
+// listed; see gitStackDir.
 func listStackLocations() ([]stackLocation, error) {
-	gitDir, err := capture("git", "rev-parse", "--path-format=absolute", "--git-dir")
-	if err != nil {
-		return nil, err
-	}
 	common, err := capture("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return nil, err
 	}
-	wtByGitDir := worktreePathByGitDir()
-	seen := map[string]bool{}
-	var locs []stackLocation
-	add := func(dir string) {
-		if dir == "" || seen[dir] {
-			return
-		}
-		seen[dir] = true
-		locs = append(locs, stackLocation{
-			GitDir:       dir,
-			WorktreePath: wtByGitDir[dir],
-			StackFile:    filepath.Join(dir, ghStackCompat.StateFileName),
-		})
-	}
-	add(gitDir)
-	add(common)
-	entries, err := os.ReadDir(filepath.Join(common, "worktrees"))
-	if err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				add(filepath.Join(common, "worktrees", e.Name()))
-			}
-		}
-	}
-	return locs, nil
+	return []stackLocation{{
+		GitDir:       common,
+		WorktreePath: worktreePathByGitDir()[common],
+		StackFile:    filepath.Join(common, ghStackCompat.StateFileName),
+	}}, nil
 }
 
 func worktreePathByGitDir() map[string]string {

@@ -208,3 +208,15 @@ func TestStalePickRows(t *testing.T) {
 		t.Errorf("text = %q", got[1].text)
 	}
 }
+
+// TestOrderForDeletionBottomUp: stale branches delete bottom-up within a
+// stack so each parent is removed (and its upstack rebased) before the
+// branches above it. The input order is the random order listStaleCandidates
+// produces.
+func TestOrderForDeletionBottomUp(t *testing.T) {
+	depth := map[string]int{"bottom": 0, "mid": 1, "top": 2}
+	got := sortByStackDepth([]string{"top", "bottom", "mid"}, depth)
+	if len(got) != 3 || got[0] != "bottom" || got[1] != "mid" || got[2] != "top" {
+		t.Fatalf("sortByStackDepth = %v, want [bottom mid top]", got)
+	}
+}
