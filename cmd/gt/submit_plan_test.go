@@ -275,6 +275,64 @@ func TestSubmitPlan_StackObjectOrderChanged(t *testing.T) {
 	}
 }
 
+// TestSubmitPlan_EmptyHeadMissingRemotePushes: gh stack init / add leave the
+// cached head empty, so an in-scope branch with no remote ref is still an
+// IsNew push, and the PR is created after that push.
+func TestSubmitPlan_EmptyHeadMissingRemotePushes(t *testing.T) {
+	repo := repoFromStack(t, `{
+  "schemaVersion": 1,
+  "stacks": [
+    {"trunk": {"branch": "main"},
+     "branches": [{"branch": "a", "head": ""}]}
+  ]
+}`)
+	snap := makeSnap(map[string]RemoteRef{}, map[string]PRSnapshot{}, nil)
+	plan, err := BuildSubmitPlan(repo, "a", snap, SubmitOpts{})
+	if err != nil {
+		t.Fatalf("BuildSubmitPlan: %v", err)
+	}
+	if plan.IsNoOp() {
+		t.Fatalf("expected non-no-op (%+v)", plan)
+	}
+	if len(plan.Pushes) != 1 {
+		t.Fatalf("Pushes len = %d, want 1 (%+v)", len(plan.Pushes), plan.Pushes)
+	}
+	p := plan.Pushes[0]
+	if p.Branch != "a" || !p.IsNew {
+		t.Fatalf("push = %+v, want IsNew push for a", p)
+	}
+	if len(plan.Creates) != 1 || plan.Creates[0].Branch != "a" {
+		t.Fatalf("Creates = %+v, want PRCreate for a", plan.Creates)
+	}
+}
+
+// TestAllowRemoteReplace: the submit-safety gate. A remote commit this branch
+// never contained (not an ancestor, not in the reflog) is refused; every
+// otherwise-safe case is allowed.
+func TestAllowRemoteReplace(t *testing.T) {
+	cases := []struct {
+		name     string
+		local    string
+		remote   string
+		ancestor bool
+		inReflog bool
+		want     bool
+	}{
+		{"first push, missing remote", "aaa", "", false, false, true},
+		{"local equals remote, no push", "aaa", "aaa", false, false, true},
+		{"fast-forward over ancestor", "aaa", "bbb", true, false, true},
+		{"own amend or rebase, reflog hit", "aaa", "bbb", false, true, true},
+		{"unknown remote commit", "aaa", "bbb", false, false, false},
+		{"reflog hit wins over unknown", "aaa", "bbb", false, true, true},
+	}
+	for _, c := range cases {
+		if got := allowRemoteReplace(c.local, c.remote, c.ancestor, c.inReflog); got != c.want {
+			t.Errorf("%s: allowRemoteReplace(%q,%q,%v,%v) = %v, want %v",
+				c.name, c.local, c.remote, c.ancestor, c.inReflog, got, c.want)
+		}
+	}
+}
+
 func TestResolveSubmitScope_DefaultTrunkToCurrent(t *testing.T) {
 	st := stateFrom(t, fiveStack)
 	stack := st.Stacks[0]

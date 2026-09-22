@@ -262,6 +262,9 @@ func cmdSubmit(args []string) error {
 		fmt.Fprintf(os.Stderr, "gt: could not load pull requests (%v); proceeding with refs only\n", snapErr)
 	}
 
+	// Live SHAs for the plan: gh stack init / add leave the cached head
+	// empty, so both the plan and the PR head SHAs come from git rev-parse.
+	refreshStackSHAs(repo)
 	plan, err := BuildSubmitPlan(repo, current, snap, opts)
 	if err != nil {
 		return err
@@ -297,6 +300,13 @@ func cmdSubmit(args []string) error {
 				plan.Pushes[i].LocalSHA = sha
 			}
 		}
+	}
+
+	// Submit-safety gate: refuse a remote commit this branch never had
+	// before any push or PR create, and leave that commit in place. No
+	// fetch and rebase; -f is the explicit override.
+	if gerr := gateRemoteReplace(plan.Pushes, opts.Force); gerr != nil {
+		return gerr
 	}
 
 	// One atomic push (decision #5). No --force fallback on lease failure.
@@ -354,6 +364,7 @@ func cmdSubmit(args []string) error {
 
 	// Persist local stack state once if restack moved refs.
 	if mut.GitMutated {
+		refreshStackSHAs(repo)
 		if perr := persistSyncState(repo); perr != nil {
 			return perr
 		}
@@ -394,6 +405,45 @@ func submitStackBranches(repo *repoStackState, current string) ([]string, map[st
 		add(b)
 	}
 	return branches, knownPRs
+}
+
+// branchReflogHas reports whether sha appears among the branch's reflog tip
+// values (git reflog --format=%H). A missing or unreadable reflog counts as
+// no, which keeps the gate on the safe side.
+func branchReflogHas(branch, sha string) bool {
+	out, err := capture("git", "reflog", "--format=%H", branch)
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == sha {
+			return true
+		}
+	}
+	return false
+}
+
+// gateRemoteReplace refuses pushes that would replace a remote commit the
+// branch never contained: for each existing-remote push, the snapshot's
+// remote SHA must be an ancestor of the local branch or present in its
+// reflog (an amend or rebase of our own). Pure allowRemoteReplace decides.
+// -f / --force is the explicit override and skips the gate.
+func gateRemoteReplace(pushes []PushRef, force bool) error {
+	if force {
+		return nil
+	}
+	for _, p := range pushes {
+		if p.IsNew {
+			continue
+		}
+		allowed := allowRemoteReplace(p.LocalSHA, p.ExpectedOld,
+			isAncestorQuiet(p.ExpectedOld, p.LocalSHA),
+			branchReflogHas(p.Branch, p.ExpectedOld))
+		if !allowed {
+			return fmt.Errorf("refusing to push %s: origin has commit %s, which this branch never contained; fetch and rebase, or use -f to force", p.Branch, p.ExpectedOld)
+		}
+	}
+	return nil
 }
 
 // restackForSubmit runs CascadeRestack on the current stack's branches. It

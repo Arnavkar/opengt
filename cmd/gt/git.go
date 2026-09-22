@@ -525,6 +525,15 @@ func isAncestor(parent, child string) bool {
 	return run2("git", "merge-base", "--is-ancestor", parent, child) == nil
 }
 
+// isAncestorQuiet is isAncestor without git's stderr passthrough, for
+// probing SHAs that may not exist locally (remote snapshot SHAs).
+func isAncestorQuiet(parent, child string) bool {
+	if parent == "" || child == "" {
+		return false
+	}
+	return exec.Command("git", "merge-base", "--is-ancestor", parent, child).Run() == nil
+}
+
 func branchHead(name string) (string, error) {
 	return capture("git", "rev-parse", "--verify", "--quiet", name)
 }

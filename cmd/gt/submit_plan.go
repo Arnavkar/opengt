@@ -136,7 +136,7 @@ func BuildSubmitPlan(repo *repoStackState, current string, snap *RemoteSnapshot,
 			PR:           pr,
 			ExpectedBase: expectedBase,
 		}
-		bsp.Push = changed || (!remoteExists && localSHA != "")
+		bsp.Push = changed || !remoteExists
 		bsp.CreatePR = pr == nil && !opts.UpdateOnly
 		bsp.UpdateBase = pr != nil && pr.Base != expectedBase
 		bsp.Publish = opts.Publish && pr != nil && pr.Draft
@@ -194,6 +194,26 @@ func BuildSubmitPlan(repo *repoStackState, current string, snap *RemoteSnapshot,
 	}
 
 	return plan, nil
+}
+
+// allowRemoteReplace is the submit-safety gate for an existing-remote push
+// (decision #11). It is pure: the caller resolves ancestor (git merge-base
+// --is-ancestor) and inReflog (git reflog --format=%H) beforehand.
+//
+//   - Remote missing: first push, no lease.
+//   - Local equals remote: nothing to push.
+//   - Remote is an ancestor of local: fast-forward; the lease is safe because
+//     no remote commit is dropped.
+//   - Remote SHA is in this branch's reflog: our own amend or rebase; allow,
+//     keeping --force-with-lease set to that snapshot SHA.
+//   - Otherwise the remote has a commit this branch never contained: refuse,
+//     and leave that commit in place. No fetch and rebase happens here;
+//     -f / --force is the explicit override.
+func allowRemoteReplace(local, remote string, ancestor, inReflog bool) bool {
+	if remote == "" || local == remote {
+		return true
+	}
+	return ancestor || inReflog
 }
 
 // IsNoOp is the fast path: true when the plan performs no git push and no

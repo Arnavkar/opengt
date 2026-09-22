@@ -224,7 +224,9 @@ The fast path validates locally, loads a remote snapshot, builds a pure plan,
 and short-circuits when nothing changed ("Stack already up to date", zero
 pushes, zero mutations). A changed submit does exactly one
 `git push --atomic` with per-ref `--force-with-lease` regardless of stack
-depth; on lease failure the entire push fails and no branch moves. PR
+depth; on lease failure the entire push fails and no branch moves. Unpublished
+branches are pushed before pull requests are opened, and submit stops when
+origin has a commit this branch never contained; `-f` remains the override. PR
 discovery is a single batched GraphQL call. New PRs are created as drafts;
 pass `-p` to mark them ready for review.
 
