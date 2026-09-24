@@ -352,7 +352,7 @@ func checkStackGitWithHeads(s trackedStack, localHeads map[string]string) []stac
 				Code: "MISSING_BRANCH", Severity: "error", Repairable: true,
 				Message: fmt.Sprintf("stack metadata references missing branch %q", b.Branch),
 				Branch:  b.Branch, Stack: chain,
-				Hint: "gt sync -d after the PR is merged, or gt doctor --repair",
+				Hint: "gt sync -d once every PR in the stack is merged or closed, or gt doctor --repair",
 			})
 			prev = b.Branch
 			continue

@@ -154,6 +154,26 @@ func TestPlanRestack_ParentsForStackOrder(t *testing.T) {
 // TestStackParents_TrunkOverridesCachedBase pins the sync restack fix: the
 // bottom branch's rebase target is the trunk branch (whose head follows the
 // moved trunk), not the base SHA cached when the stack was written.
+func TestPlanRestack_MergedBranchIsNotRebased(t *testing.T) {
+	stack := []trackedBranch{
+		{Branch: "a", Base: "main"},
+		{Branch: "b"},
+	}
+	heads := map[string]string{"a": "sha-a", "b": "sha-b"}
+	parents := map[string]string{"a": "main", "b": "a"}
+	ancestor := map[string]bool{"a": false, "b": false}
+	actions := planRestack(stack, heads, parents, ancestor, map[string]string{}, "b", RestackOpts{
+		Force:  true,
+		Merged: map[string]bool{"a": true},
+	})
+	if actions[0].Rebase || actions[0].SkipReason == "" {
+		t.Fatalf("merged branch a = %+v, want skipped", actions[0])
+	}
+	if !actions[1].Rebase || actions[1].Parent != "a" {
+		t.Fatalf("open branch b = %+v, want rebase onto a", actions[1])
+	}
+}
+
 func TestStackParents_TrunkOverridesCachedBase(t *testing.T) {
 	stack := []trackedBranch{
 		{Branch: "a", Base: "stale-trunk-sha"},

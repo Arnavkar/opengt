@@ -129,7 +129,7 @@ func validateBranchExistence(stack resolvedStack, isLocal func(string) bool) err
 			continue
 		}
 		if !isLocal(b.Branch) {
-			return fmt.Errorf("stack metadata references missing branch %q\nRun:\n  gt sync -d after the PR is merged, or gt doctor --repair\nNo changes were made.", b.Branch)
+			return fmt.Errorf("stack metadata references missing branch %q\nRun:\n  gt sync -d once every PR in the stack is merged or closed, or gt doctor --repair\nNo changes were made.", b.Branch)
 		}
 	}
 	return nil

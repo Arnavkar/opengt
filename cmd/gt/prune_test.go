@@ -196,6 +196,35 @@ func TestStripStackBranches(t *testing.T) {
 	}
 }
 
+func TestFinishedStackKeepsMergedBranchUnderOpenPR(t *testing.T) {
+	groups := [][]localBranch{
+		{{name: "bottom", local: true}, {name: "top", local: true}},
+	}
+	prs := []pullRequest{
+		{Number: 1, State: "MERGED", HeadRefName: "bottom"},
+		{Number: 2, State: "OPEN", HeadRefName: "top"},
+	}
+	if got := finishedStackBranches(groups, prs, map[string]bool{"main": true}, true); len(got) != 0 {
+		t.Fatalf("partial stack was finished: %#v", got)
+	}
+}
+
+func TestFinishedStackDeletesWhenEveryPRIsDone(t *testing.T) {
+	groups := [][]localBranch{
+		{{name: "bottom", local: true}, {name: "top", local: true}},
+		{{name: "still-open", local: true}},
+	}
+	prs := []pullRequest{
+		{Number: 1, State: "MERGED", HeadRefName: "bottom"},
+		{Number: 2, State: "CLOSED", HeadRefName: "top"},
+		{Number: 3, State: "OPEN", HeadRefName: "still-open"},
+	}
+	got := finishedStackBranches(groups, prs, map[string]bool{"main": true}, true)
+	if len(got) != 2 || got[0].name != "bottom" || got[1].name != "top" {
+		t.Fatalf("finishedStackBranches = %#v", got)
+	}
+}
+
 func TestStalePickRows(t *testing.T) {
 	got := stalePickRows([]staleBranch{
 		{name: "feat/a", reason: "PR #1 merged"},

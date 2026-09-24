@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -428,8 +429,8 @@ func TestSyncDeletesGoneUpstream(t *testing.T) {
 	if strings.Contains(listed.stderr, "scratch") {
 		t.Errorf("gt sync offered to prune unrelated branch scratch:\n%s", listed.output())
 	}
-	if !strings.Contains(listed.stderr, "layer-one") {
-		t.Errorf("gt sync did not report the stale stack branch:\n%s", listed.output())
+	if strings.Contains(listed.stderr, "layer-one") {
+		t.Errorf("gt sync offered to prune a stack that is not fully merged:\n%s", listed.output())
 	}
 	if f.git("branch", "--list", "scratch") == "" {
 		t.Error("gt sync deleted scratch without -d or a prompt")
@@ -442,8 +443,8 @@ func TestSyncDeletesGoneUpstream(t *testing.T) {
 	if f.git("branch", "--list", "scratch") == "" {
 		t.Fatal("gt sync -d deleted unrelated branch scratch")
 	}
-	if f.git("branch", "--list", "layer-one") != "" {
-		t.Fatal("stale stack branch layer-one still exists after gt sync -d")
+	if f.git("branch", "--list", "layer-one") == "" {
+		t.Fatal("gt sync -d deleted layer-one; a gone remote is not a fully merged stack")
 	}
 }
 
@@ -739,11 +740,11 @@ func TestLinkedWorktreeSharesRepoRootState(t *testing.T) {
 
 	// A sync (with prune) run from the worktree updates the repo-root file.
 	worktree.gt("sync", "-d")
-	if f.git("branch", "--list", "layer-one") != "" {
-		t.Error("sync -d from the worktree did not delete the stale branch")
+	if f.git("branch", "--list", "layer-one") == "" {
+		t.Error("sync -d deleted layer-one while layer-two is still in the stack")
 	}
-	if got := f.tracked(); len(got) != 1 || got[0] != "layer-two" {
-		t.Errorf("repo-root state tracks %v after worktree sync -d, want [layer-two]", got)
+	if got := f.tracked(); len(got) != 2 || got[0] != "layer-one" || got[1] != "layer-two" {
+		t.Errorf("repo-root state tracks %v after worktree sync -d, want [layer-one layer-two]", got)
 	}
 
 	// A per-worktree state file (which gh stack writes when its own commands
@@ -754,8 +755,8 @@ func TestLinkedWorktreeSharesRepoRootState(t *testing.T) {
 		[]byte(`{"schemaVersion":1,"stacks":[{"trunk":{"branch":"main"},"branches":[{"branch":"bogus"}]}]}`+"\n"),
 		0o644)
 	worktree.gt("sync")
-	if got := f.tracked(); len(got) != 1 || got[0] != "layer-two" {
-		t.Errorf("per-worktree state leaked into gt's view: %v, want [layer-two]", got)
+	if got := f.tracked(); len(got) != 2 || got[0] != "layer-one" || got[1] != "layer-two" {
+		t.Errorf("per-worktree state leaked into gt's view: %v, want [layer-one layer-two]", got)
 	}
 }
 
@@ -856,12 +857,10 @@ func TestSyncRestacksOntoMovedTrunk(t *testing.T) {
 	}
 }
 
-// TestSyncPrunesMergedBranchAndRebasesOntoTrunk: when a stack branch's PR has
-// landed (here simulated by merging it into main and deleting the remote
-// branch) and -d clears it, the branches above it must be rebased onto the
-// trunk with the deleted branch's commits dropped — not left stranded on a
-// deleted ref the way `git branch -D` alone would leave them.
-func TestSyncPrunesMergedBranchAndRebasesOntoTrunk(t *testing.T) {
+// TestSyncKeepsMergedBranchInStack: a merged lower branch stays in the stack
+// and is not rebased. The branch above it is restacked onto that merged
+// branch, not onto the trunk with the merged commits dropped.
+func TestSyncKeepsMergedBranchInStack(t *testing.T) {
 	f := newFixture(t)
 	f.layer("layer-one", "Add layer one")
 	f.layer("layer-two", "Add layer two")
@@ -869,41 +868,44 @@ func TestSyncPrunesMergedBranchAndRebasesOntoTrunk(t *testing.T) {
 		f.git("push", "--quiet", "-u", "origin", b)
 	}
 
-	// Merge layer-one into the trunk and drop its remote branch, as GitHub
-	// does after a merge with branch auto-deletion.
+	path := filepath.Join(f.stackDir(), "gh-stack")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	stacks := doc["stacks"].([]any)
+	branches := stacks[0].(map[string]any)["branches"].([]any)
+	branches[0].(map[string]any)["pullRequest"] = map[string]any{"number": 1, "merged": true}
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	layerOne := f.git("rev-parse", "layer-one")
+
 	f.git("checkout", "--quiet", "main")
-	f.git("merge", "--no-ff", "--quiet", "-m", "Merge layer-one", "layer-one")
+	f.write("trunk-moves.txt", "moved\n")
+	f.git("add", "-A")
+	f.git("commit", "--quiet", "-m", "Trunk moves on")
 	f.git("push", "--quiet", "origin", "main")
-	f.git("push", "--quiet", "origin", "--delete", "layer-one")
+	f.git("reset", "--hard", "--quiet", "HEAD~1")
 	f.git("checkout", "--quiet", "layer-two")
 
 	f.gt("sync", "-d")
 
-	if f.git("branch", "--list", "layer-one") != "" {
-		t.Fatal("stale stack branch layer-one still exists after gt sync -d")
+	if got := f.git("rev-parse", "layer-one"); got != layerOne {
+		t.Fatalf("merged layer-one was rebased: %s -> %s", layerOne, got)
 	}
-	if got := f.git("rev-parse", "layer-two^"); got != f.git("rev-parse", "main") {
-		t.Errorf("layer-two was not rebased onto the trunk (parent %s, main %s)\n%s",
-			got, f.git("rev-parse", "main"), f.git("log", "--graph", "--oneline", "--all"))
+	if got := f.tracked(); len(got) != 2 || got[0] != "layer-one" || got[1] != "layer-two" {
+		t.Fatalf("stack state = %v, want [layer-one layer-two]", got)
 	}
-	if n := f.commitsIn("main..layer-two"); n != 1 {
-		t.Errorf("layer-two carries %d commits above main, want 1 (the deleted branch's commit must be dropped):\n%s",
-			n, f.git("log", "--graph", "--oneline", "--all"))
-	}
-	if got := f.tracked(); len(got) != 1 || got[0] != "layer-two" {
-		t.Errorf("stack state still tracks %v, want [layer-two]", got)
-	}
-	// The persisted state must describe the repository as it now is: the
-	// surviving branch hangs off the trunk head, not the deleted branch's
-	// SHA, and the trunk head is current.
-	st := f.state()
-	mainSHA := f.git("rev-parse", "main")
-	if st.Stacks[0].Branches[0].Base != mainSHA {
-		t.Errorf("persisted base for layer-two = %s, want the trunk head %s", st.Stacks[0].Branches[0].Base, mainSHA)
-	}
-	if st.Stacks[0].Trunk.Head != mainSHA {
-		t.Errorf("persisted trunk head = %s, want %s", st.Stacks[0].Trunk.Head, mainSHA)
-	}
+	f.git("merge-base", "--is-ancestor", "layer-one", "layer-two")
 }
 
 // TestSyncNoRestack asserts `--no-restack` skips the cascade restack step: no

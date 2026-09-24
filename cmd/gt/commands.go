@@ -685,8 +685,8 @@ func cmdSync(args []string) error {
 	plan := BuildSyncPlan(repo, snap)
 
 	// executeSyncPlan runs the whole sync flow in order: fast-forward the
-	// trunk and behind branches, prune merged/closed/gone stack branches
-	// (rebasing what was above them onto the trunk), cascade-restack every
+	// trunk and behind branches, delete a stack only when every PR in it is
+	// merged or closed, cascade-restack every
 	// stack against the updated trunk, and persist the refreshed state.
 	_, err = executeSyncPlan(plan, snap, *noRestack, *force, *deleteAll)
 	return err
@@ -757,16 +757,15 @@ func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, noRestack bool, force 
 		return moved, err
 	}
 
-	// Prune rewrites the stack chains (it deletes merged branches and rebases
-	// what was above them onto the trunk), so the restack must run against
-	// the updated chains, not the pre-prune plan.
+	// A finished stack is removed whole. A stack that still has open work keeps
+	// its merged branches, so the restack runs against that full chain.
 	var restacked bool
 	if !noRestack {
 		repo, err := loadRepoStacks()
 		if err != nil {
 			return moved, err
 		}
-		restacked, err = restackSyncStacks(repo, force)
+		restacked, err = restackSyncStacks(repo, snap, force)
 		if err != nil {
 			return moved, err
 		}
@@ -849,15 +848,17 @@ func fastForwardSyncBranches(plan SyncPlan, snap *RemoteSnapshot) (bool, error) 
 // restackSyncStacks cascade-restacks every tracked stack against its trunk,
 // skipping stacks whose branches are all checked out in other worktrees. It
 // returns moved=true when any local ref changed.
-func restackSyncStacks(repo *repoStackState, force bool) (bool, error) {
+func restackSyncStacks(repo *repoStackState, snap *RemoteSnapshot, force bool) (bool, error) {
+	merged := mergedForRestack(repo, snap)
 	var moved bool
 	for _, s := range repo.Stacks {
 		if stackAllInOtherWorktrees(s.trackedStack) {
 			continue
 		}
 		results, _, err := CascadeRestack(s.trackedStack.Branches, RestackOpts{
-			Force: force,
-			Trunk: s.trackedStack.Trunk.Branch,
+			Force:  force,
+			Trunk:  s.trackedStack.Trunk.Branch,
+			Merged: merged,
 		})
 		if err != nil {
 			return moved, err
@@ -869,6 +870,35 @@ func restackSyncStacks(repo *repoStackState, force bool) (bool, error) {
 		}
 	}
 	return moved, nil
+}
+
+// mergedForRestack is the set of stack branches whose pull request is merged.
+// Live snapshot state wins over the cached merged flag. Those branches stay
+// in the stack and are not rebased.
+func mergedForRestack(repo *repoStackState, snap *RemoteSnapshot) map[string]bool {
+	out := map[string]bool{}
+	if repo == nil {
+		return out
+	}
+	for _, s := range repo.Stacks {
+		for _, b := range s.Branches {
+			if b.Branch == "" {
+				continue
+			}
+			if snap != nil && snap.PRs != nil {
+				if pr, ok := snap.PRs[b.Branch]; ok {
+					if pr.Merged || strings.EqualFold(pr.State, "MERGED") {
+						out[b.Branch] = true
+					}
+					continue
+				}
+			}
+			if b.PullRequest != nil && b.PullRequest.Merged {
+				out[b.Branch] = true
+			}
+		}
+	}
+	return out
 }
 
 // refreshStackSHAs updates the cached head/base SHAs in the repo state from

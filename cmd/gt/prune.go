@@ -29,26 +29,27 @@ type staleBranch struct {
 	reason string
 }
 
-// pruneStaleBranches offers to delete local branches whose upstream is gone
-// or whose pull request has been merged or closed. Sync has already fetched
-// stacked remotes and dropped missing origin refs, so "gone" is visible. PR
-// state is consumed from snap (loaded once by LoadRemoteSnapshot) rather than
-// a fresh `gh pr list` shell-out.
+// pruneStaleBranches deletes a stack only when every branch in it has a pull
+// request and every one of those pull requests is merged or closed. A stack
+// that still has an open PR, or a branch with no PR, is left intact — merged
+// branches stay in the stack so restack and `gh stack view` keep the full
+// chain. gh stack --prune deletes local branches for merged PRs but keeps
+// that metadata; gt goes one step further and does not delete those branches
+// until the whole stack is finished.
 //
-// Each confirmed deletion rebases the branches above the deleted one onto its
-// parent (the trunk for the bottom branch, dropping the deleted branch's
-// commits) before removing it — the same machinery as `gt delete`. It returns
-// true when anything was deleted or cleaned from the stack state.
+// PR state comes from snap (loaded once by LoadRemoteSnapshot). A missing
+// snapshot does not delete anything: gone remotes alone are not a finished
+// stack.
 func pruneStaleBranches(snap *RemoteSnapshot, deleteAll bool) (bool, error) {
-	branches, err := listStaleCandidates()
+	groups, err := listTrackedStackGroups()
 	if err != nil {
 		return false, err
 	}
 	prs, prsAvailable := prsFromSnapshot(snap)
 	if !prsAvailable {
-		fmt.Fprintf(os.Stderr, "gt: no pull request snapshot available; checking deleted remotes only\n")
+		fmt.Fprintf(os.Stderr, "gt: no pull request snapshot available; leaving stacks in place\n")
 	}
-	stale := staleLocalsWithPRs(branches, prs, trunkNames(), prsAvailable)
+	stale := finishedStackBranches(groups, prs, trunkNames(), prsAvailable)
 	if len(stale) == 0 {
 		return false, nil
 	}
@@ -64,25 +65,107 @@ func pruneStaleBranches(snap *RemoteSnapshot, deleteAll bool) (bool, error) {
 	}
 
 	changed := false
-	names := make([]string, len(chosen))
-	for i, s := range chosen {
-		names[i] = s.name
-	}
-	for _, name := range orderForDeletion(names) {
-		if !isLocalBranch(name) {
-			// A state entry with no local branch: clean the state only.
-			if err := dropBranchesFromStackFiles(map[string]bool{name: true}); err == nil {
-				changed = true
-			}
-			continue
-		}
-		if err := deleteBranch(name); err != nil {
-			fmt.Fprintf(os.Stderr, "gt: could not delete %s: %v\n", name, err)
+	for _, stack := range groupChosenByStack(chosen, groups) {
+		if err := deleteFinishedStack(stack); err != nil {
+			fmt.Fprintf(os.Stderr, "gt: could not delete stack: %v\n", err)
 			continue
 		}
 		changed = true
 	}
 	return changed, nil
+}
+
+// finishedStackBranches returns every branch of stacks whose pull requests are
+// all merged or closed. Stacks are not split: one open or untracked branch
+// keeps every merged branch below it.
+func finishedStackBranches(groups [][]localBranch, prs []pullRequest, trunks map[string]bool, prsAvailable bool) []staleBranch {
+	if !prsAvailable {
+		return nil
+	}
+	var out []staleBranch
+	for _, group := range groups {
+		var reasons []staleBranch
+		done := len(group) > 0
+		for _, b := range group {
+			one := staleLocalsWithPRs([]localBranch{b}, prs, trunks, true)
+			if len(one) != 1 || !strings.HasPrefix(one[0].reason, "PR #") {
+				done = false
+				break
+			}
+			reasons = append(reasons, one[0])
+		}
+		if done {
+			out = append(out, reasons...)
+		}
+	}
+	return out
+}
+
+// groupChosenByStack buckets a flat deletion list back into the stacks it
+// came from, so a finished stack is removed as one unit.
+func groupChosenByStack(chosen []staleBranch, groups [][]localBranch) [][]string {
+	want := map[string]bool{}
+	for _, s := range chosen {
+		want[s.name] = true
+	}
+	var out [][]string
+	for _, group := range groups {
+		var names []string
+		for _, b := range group {
+			if want[b.name] {
+				names = append(names, b.name)
+			}
+		}
+		if len(names) > 0 {
+			out = append(out, names)
+		}
+	}
+	return out
+}
+
+// deleteFinishedStack removes every branch of a stack that is fully merged or
+// closed. Nothing above those branches survives, so there is no restack onto
+// the trunk. The stack entry is dropped with the branches.
+func deleteFinishedStack(names []string) error {
+	if err := validatePaused(); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if isLocalBranch(name) {
+			if err := validateWorktreeForBranch(name); err != nil {
+				return err
+			}
+		}
+	}
+	current, err := currentBranch()
+	if err != nil {
+		current = ""
+	}
+	trunk := fallbackTrunk(trunkNames())
+	for _, name := range names {
+		if name == current {
+			if err := run("git", "checkout", trunk); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	set := map[string]bool{}
+	for _, name := range names {
+		set[name] = true
+	}
+	if err := dropBranchesFromStackFiles(set); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if !isLocalBranch(name) {
+			continue
+		}
+		if err := deleteLocalBranch(name, "", trunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // orderForDeletion sorts branches bottom-up within their stack, so a branch
@@ -189,7 +272,7 @@ func listLocalBranches() ([]localBranch, error) {
 	return parseLocalBranches(out), nil
 }
 
-func listStaleCandidates() ([]localBranch, error) {
+func listTrackedStackGroups() ([][]localBranch, error) {
 	locals, err := listLocalBranches()
 	if err != nil {
 		return nil, err
@@ -202,13 +285,13 @@ func listStaleCandidates() ([]localBranch, error) {
 	if err != nil {
 		return nil, err
 	}
-	known := map[string]bool{}
+	var groups [][]localBranch
 	for _, s := range st.Stacks {
+		var group []localBranch
 		for _, br := range s.Branches {
 			if br.Branch == "" {
 				continue
 			}
-			known[br.Branch] = true
 			cur := byName[br.Branch]
 			cur.name = br.Branch
 			if br.PullRequest != nil && br.PullRequest.Number != 0 {
@@ -217,14 +300,13 @@ func listStaleCandidates() ([]localBranch, error) {
 					cur.mergedPR = br.PullRequest.Number
 				}
 			}
-			byName[br.Branch] = cur
+			group = append(group, cur)
+		}
+		if len(group) > 0 {
+			groups = append(groups, group)
 		}
 	}
-	out := make([]localBranch, 0, len(known))
-	for name := range known {
-		out = append(out, byName[name])
-	}
-	return out, nil
+	return groups, nil
 }
 
 func parseLocalBranches(out string) []localBranch {

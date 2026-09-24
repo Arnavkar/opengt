@@ -38,6 +38,12 @@ func planRestack(
 		parent := parents[branch]
 		act := restackAction{Branch: branch, Parent: parent}
 
+		if opts.Merged[branch] {
+			act.SkipReason = "pull request is merged"
+			actions = append(actions, act)
+			continue
+		}
+
 		if wt := worktree[branch]; wt != "" && branch != currentBranch {
 			act.SkipReason = "checked out in another worktree: " + wt
 			actions = append(actions, act)

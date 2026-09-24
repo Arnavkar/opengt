@@ -152,6 +152,9 @@ type RestackOpts struct {
 	Force       bool
 	Interactive bool
 	Trunk       string
+	// Merged branches are left at their current SHA. The stack order is
+	// unchanged, so the branch above still rebases onto the merged branch.
+	Merged map[string]bool
 }
 
 // CascadeRestack rebases each branch onto its parent in stack order, returning

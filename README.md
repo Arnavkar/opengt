@@ -150,8 +150,9 @@ git rebase / reset / branch -f
                     Run `gt doctor` afterwards if you touched stack branches.
 ```
 
-`gt sync -d` only deletes branches that appear in local `gh-stack` state. Ordinary
-untracked branches are left alone, even if their upstream is gone.
+`gt sync -d` deletes a stack only when every pull request in it is merged or
+closed. Merged branches in a stack that still has open work stay in the stack,
+so restack keeps the full chain. Ordinary untracked branches are left alone.
 
 ### `gt doctor`
 
