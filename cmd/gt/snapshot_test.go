@@ -67,6 +67,29 @@ func TestLoadRemoteSnapshot_HappyPath(t *testing.T) {
 	}
 }
 
+func TestLoadSubmitSnapshot_IncludesNativeStack(t *testing.T) {
+	withFakes(t,
+		func(b []string) (RemoteRefSnapshot, error) { return fakeRefs(b), nil },
+		func(_ map[string]int, b []string) (map[string]PRSnapshot, error) { return fakePRs(b), nil },
+	)
+	old := loadRemoteStackFn
+	loadRemoteStackFn = func(id string) (*RemoteStackSnapshot, error) {
+		if id != "st1" {
+			t.Errorf("stack id = %q, want st1", id)
+		}
+		return &RemoteStackSnapshot{ID: id, Numbers: []int{1, 2}}, nil
+	}
+	t.Cleanup(func() { loadRemoteStackFn = old })
+
+	snap, err := LoadSubmitSnapshot([]string{"main"}, nil, "st1")
+	if err != nil {
+		t.Fatalf("LoadSubmitSnapshot error = %v", err)
+	}
+	if snap.RemoteStack == nil || snap.RemoteStack.ID != "st1" {
+		t.Fatalf("RemoteStack = %#v, want st1", snap.RemoteStack)
+	}
+}
+
 func TestLoadRemoteSnapshot_BothErrorsSurface(t *testing.T) {
 	refsErr := errors.New("refs boom")
 	prsErr := errors.New("prs boom")

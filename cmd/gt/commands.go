@@ -216,161 +216,10 @@ func cmdSubmit(args []string) error {
 		NoVerify:   *noVerify,
 	}
 
-	repo, err := loadRepoStacks()
-	if err != nil {
-		return err
-	}
-	current, err := currentBranch()
-	if err != nil {
-		return err
-	}
-
-	// Pre-mutation validation (decision #10). --native may still proceed
-	// here, before any mutation has happened (decision #8); otherwise surface
-	// the error and a hint pointing at the fallback.
-	if verr := validateStackForMutation(repo, current); verr != nil {
-		if *native {
-			return nativeSubmit(*edit, *publish, fs.Args())
-		}
-		fmt.Fprintln(os.Stderr, verr)
-		fmt.Fprintln(os.Stderr, "gt: hint — re-run with --native to delegate to gh stack submit")
-		return verr
-	}
 	if *native {
-		return nativeSubmit(*edit, *publish, fs.Args())
+		return executeSubmit(opts, true, *edit, *publish, fs.Args())
 	}
-
-	if !opts.Stack {
-		if stack, ok := findStackForBranch(repo, current); ok {
-			if above := upstackOf(stack.trackedStack, current); len(above) > 0 {
-				if confirmSubmitUpstack(above) {
-					opts.Stack = true
-				}
-			}
-		}
-	}
-
-	// Gather branches + knownPRs across the current stack. The snapshot
-	// covers the whole stack so any scope (trunk→current or --stack) is
-	// satisfied; ResolveSubmitScope narrows the plan.
-	branches, knownPRs := submitStackBranches(repo, current)
-	snap, snapErr := LoadRemoteSnapshot(branches, knownPRs)
-	if snap == nil {
-		return snapErr
-	}
-	if snapErr != nil {
-		fmt.Fprintf(os.Stderr, "gt: could not load pull requests (%v); proceeding with refs only\n", snapErr)
-	}
-
-	// Live SHAs for the plan: gh stack init / add leave the cached head
-	// empty, so both the plan and the PR head SHAs come from git rev-parse.
-	refreshStackSHAs(repo)
-	plan, err := BuildSubmitPlan(repo, current, snap, opts)
-	if err != nil {
-		return err
-	}
-
-	// No-op fast path (decision #6): zero pushes, zero mutations.
-	if plan.IsNoOp() && !opts.Always {
-		fmt.Fprintln(os.Stderr, "Stack already up to date")
-		return nil
-	}
-
-	if opts.DryRun {
-		printSubmitPlan(os.Stderr, plan)
-		return nil
-	}
-
-	mut := MutationState{}
-
-	// Restack before any network I/O (decision #4). Local refs move here; the
-	// remote lease ExpectedOld stays from the snapshot.
-	if opts.Restack {
-		moved, rerr := restackForSubmit(repo, current, opts.Force)
-		if rerr != nil {
-			return rerr
-		}
-		if moved {
-			mut.GitMutated = true
-			for i := range plan.Pushes {
-				sha, err := branchHead(plan.Pushes[i].Branch)
-				if err != nil {
-					return err
-				}
-				plan.Pushes[i].LocalSHA = sha
-			}
-		}
-	}
-
-	// Submit-safety gate: refuse a remote commit this branch never had
-	// before any push or PR create, and leave that commit in place. No
-	// fetch and rebase; -f is the explicit override.
-	if gerr := gateRemoteReplace(plan.Pushes, opts.Force); gerr != nil {
-		return gerr
-	}
-
-	// One atomic push (decision #5). No --force fallback on lease failure.
-	if len(plan.Pushes) > 0 {
-		if perr := AtomicPush(plan.Pushes, PushOpts{
-			Force:    opts.Force,
-			NoVerify: opts.NoVerify,
-			DryRun:   opts.DryRun,
-		}); perr != nil {
-			explainSwallowedPush("")
-			return perr
-		}
-		mut.GitMutated = true
-	}
-
-	// PR mutations via gh subprocess. Create errors abort (state would be
-	// inconsistent after a push with no PR); base/publish/automerge failures
-	// are warnings and continue.
-	if cerr := createPRs(plan.Creates, opts.Draft); cerr != nil {
-		return cerr
-	}
-	if len(plan.Creates) > 0 {
-		mut.RemoteMutated = true
-	}
-	if werr := updatePRBases(plan.BaseUpdates); werr != nil {
-		fmt.Fprintf(os.Stderr, "gt: warning: %v\n", werr)
-	} else if len(plan.BaseUpdates) > 0 {
-		mut.RemoteMutated = true
-	}
-	if werr := publishPRs(plan.PublishUpdates); werr != nil {
-		fmt.Fprintf(os.Stderr, "gt: warning: %v\n", werr)
-	} else if len(plan.PublishUpdates) > 0 {
-		mut.RemoteMutated = true
-	}
-	if werr := disableAutoMerges(plan.AutoMergeDisables); werr != nil {
-		fmt.Fprintf(os.Stderr, "gt: warning: %v\n", werr)
-	} else if len(plan.AutoMergeDisables) > 0 {
-		mut.RemoteMutated = true
-	}
-
-	// Stack object update. Warn on failure; the push already succeeded.
-	if plan.StackUpdate != nil {
-		client, cerr := NewStackRemoteClient()
-		if cerr != nil {
-			fmt.Fprintf(os.Stderr, "gt: warning: stack remote: %v\n", cerr)
-		} else {
-			changed, serr := syncStackOrder(client, plan.StackUpdate.StackID, plan.StackUpdate.Numbers)
-			if serr != nil {
-				fmt.Fprintf(os.Stderr, "gt: warning: stack update: %v\n", serr)
-			} else if changed {
-				mut.RemoteMutated = true
-			}
-		}
-	}
-
-	// Persist local stack state once if restack moved refs.
-	if mut.GitMutated {
-		refreshStackSHAs(repo)
-		if perr := persistSyncState(repo); perr != nil {
-			return perr
-		}
-	}
-
-	return nil
+	return executeSubmit(opts, false, *edit, *publish, fs.Args())
 }
 
 func confirmSubmitUpstack(names []string) bool {
@@ -682,13 +531,17 @@ func cmdSync(args []string) error {
 		fmt.Fprintf(os.Stderr, "gt: could not load pull requests (%v); proceeding with refs only\n", snapErr)
 	}
 
-	plan := BuildSyncPlan(repo, snap)
+	groups, err := listTrackedStackGroups()
+	if err != nil {
+		return err
+	}
+	plan := BuildSyncPlan(repo, snap, groups, trunkNames())
 
 	// executeSyncPlan runs the whole sync flow in order: fast-forward the
 	// trunk and behind branches, delete a stack only when every PR in it is
 	// merged or closed, cascade-restack every
 	// stack against the updated trunk, and persist the refreshed state.
-	_, err = executeSyncPlan(plan, snap, *noRestack, *force, *deleteAll)
+	_, err = executeSyncPlan(plan, snap, groups, *noRestack, *force, *deleteAll)
 	return err
 }
 
@@ -746,13 +599,16 @@ func buildKnownPRs(repo *repoStackState) map[string]int {
 // and cascade restacks. It returns moved=true when any local ref changed, so
 // the caller can persist stack state once. No remote mutations happen here;
 // a restack conflict aborts with the error before any push.
-func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, noRestack bool, force bool, deleteAll bool) (bool, error) {
+func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, groups [][]localBranch, noRestack bool, force bool, deleteAll bool) (bool, error) {
 	moved, err := fastForwardSyncBranches(plan, snap)
 	if err != nil {
 		return moved, err
 	}
 
-	pruned, err := pruneStaleBranches(snap, deleteAll)
+	if snap == nil || snap.PRs == nil {
+		fmt.Fprintf(os.Stderr, "gt: no pull request snapshot available; leaving stacks in place\n")
+	}
+	pruned, err := pruneStaleBranches(plan.Stale, groups, deleteAll)
 	if err != nil {
 		return moved, err
 	}

@@ -24,6 +24,19 @@ var batchPRSnapshotFn = func(known map[string]int, heads []string) (map[string]P
 	return c.BatchPRSnapshot(known, heads)
 }
 
+// loadRemoteStackFn reads the native GitHub stack. Tests swap it. An empty
+// id returns a nil snapshot and no error.
+var loadRemoteStackFn = func(stackID string) (*RemoteStackSnapshot, error) {
+	if stackID == "" {
+		return nil, nil
+	}
+	c, err := NewStackRemoteClient()
+	if err != nil {
+		return nil, err
+	}
+	return c.GetStack(stackID)
+}
+
 // LoadRemoteSnapshot loads git refs and GitHub PRs concurrently and returns a
 // single RemoteSnapshot. Per refactor-plan.md decision #6, the two reads run
 // in goroutines so the latency floor is max(GitRTT, GitHubRTT) rather than
@@ -83,4 +96,42 @@ func LoadRemoteSnapshot(branches []string, knownPRs map[string]int) (*RemoteSnap
 		return snap, prsErr
 	}
 	return snap, nil
+}
+
+// LoadSubmitSnapshot loads refs, pull requests, and the native stack
+// together. A stack read failure leaves RemoteStack nil and is joined onto
+// the returned error; refs are still returned when they succeeded.
+func LoadSubmitSnapshot(branches []string, knownPRs map[string]int, stackID string) (*RemoteSnapshot, error) {
+	var (
+		snap     *RemoteSnapshot
+		snapErr  error
+		stack    *RemoteStackSnapshot
+		stackErr error
+		wg       sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		snap, snapErr = LoadRemoteSnapshot(branches, knownPRs)
+	}()
+	go func() {
+		defer wg.Done()
+		stack, stackErr = loadRemoteStackFn(stackID)
+	}()
+	wg.Wait()
+
+	if snap == nil {
+		if stackErr != nil {
+			return nil, errors.Join(snapErr, stackErr)
+		}
+		return nil, snapErr
+	}
+	if stackErr != nil {
+		if snapErr != nil {
+			return snap, errors.Join(snapErr, stackErr)
+		}
+		return snap, stackErr
+	}
+	snap.RemoteStack = stack
+	return snap, snapErr
 }

@@ -1,9 +1,7 @@
 package main
 
-import "fmt"
-
-// BuildSyncPlan computes a SyncPlan purely from the repo stack state and a
-// remote snapshot. It does no I/O.
+// BuildSyncPlan computes a SyncPlan purely from already-loaded data. It does
+// no I/O.
 //
 // Sync is repo-wide (design decision #9): it iterates every stack in
 // repo.Stacks, not just HEAD's. For each stack it produces a StackSyncPlan
@@ -19,17 +17,19 @@ import "fmt"
 // only — ancestry is confirmed by the executor, since isAncestor is not
 // pure.
 //
-// Stale candidates are tracked members (non-trunk) whose remote ref no
-// longer exists and which have no open PR in snap.PRs. The executor
-// confirms via the existing prune logic.
-func BuildSyncPlan(repo *repoStackState, snap *RemoteSnapshot) SyncPlan {
+// Stale is the finished stacks: every branch has a pull request and every
+// one of those pull requests is merged or closed. groups and trunks are
+// loaded by the caller (git branch list and trunk names). The executor
+// deletes only this list.
+func BuildSyncPlan(repo *repoStackState, snap *RemoteSnapshot, groups [][]localBranch, trunks map[string]bool) SyncPlan {
 	var plan SyncPlan
 	if repo == nil {
 		return plan
 	}
 	plan.Trunk = buildTrunkPlan(repo, snap)
 	plan.Stacks = buildStackSyncPlans(repo)
-	plan.Stale = buildStaleCandidates(repo, snap)
+	prs, prsAvailable := prsFromSnapshot(snap)
+	plan.Stale = finishedStackBranches(groups, prs, trunks, prsAvailable)
 	return plan
 }
 
@@ -71,55 +71,4 @@ func buildStackSyncPlans(repo *repoStackState) []StackSyncPlan {
 		plans = append(plans, StackSyncPlan{Stack: s.trackedStack})
 	}
 	return plans
-}
-
-// buildStaleCandidates collects tracked members whose remote ref is gone
-// and which have no open PR. A branch claimed by multiple stacks is listed
-// once. Trunks are never stale. When snap is nil, no staleness can be
-// computed from refs, so nothing is returned.
-func buildStaleCandidates(repo *repoStackState, snap *RemoteSnapshot) []staleBranch {
-	if snap == nil {
-		return nil
-	}
-	var stale []staleBranch
-	seen := map[string]bool{}
-	for _, s := range repo.Stacks {
-		for _, b := range s.Branches {
-			branch := b.Branch
-			if branch == "" || seen[branch] {
-				continue
-			}
-			seen[branch] = true
-			ref, listed := snap.Refs.Refs[branch]
-			if listed && ref.Exists {
-				continue
-			}
-			if hasOpenPR(snap.PRs, branch) {
-				continue
-			}
-			stale = append(stale, staleBranch{name: branch, reason: staleReasonMissingRemote(branch, listed)})
-		}
-	}
-	return stale
-}
-
-// hasOpenPR reports whether snap.PRs holds an OPEN PR for the given head.
-// A nil PR map means PR data is unavailable; the caller treats that as
-// "no open PR known" and lets the executor confirm.
-func hasOpenPR(prs map[string]PRSnapshot, head string) bool {
-	if prs == nil {
-		return false
-	}
-	pr, ok := prs[head]
-	if !ok {
-		return false
-	}
-	return pr.State == "OPEN"
-}
-
-func staleReasonMissingRemote(branch string, listed bool) string {
-	if !listed {
-		return fmt.Sprintf("%s has no remote ref and no open PR", branch)
-	}
-	return fmt.Sprintf("%s is gone on remote and has no open PR", branch)
 }

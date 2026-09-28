@@ -330,7 +330,7 @@ type StackSyncPlan struct {
 }
 
 // SyncPlan is the pure output of BuildSyncPlan: the trunk fast-forward, the
-// per-stack restacks, and the stale branches to prune.
+// per-stack restacks, and the finished stacks to delete.
 type SyncPlan struct {
 	Trunk  TrunkPlan
 	Stacks []StackSyncPlan
@@ -344,7 +344,7 @@ type SyncPlan struct {
 //
 // Contract (implemented in sync_plan.go):
 //
-//	func BuildSyncPlan(repo *repoStackState, snap *RemoteSnapshot) SyncPlan
+//	func BuildSyncPlan(repo *repoStackState, snap *RemoteSnapshot, groups [][]localBranch, trunks map[string]bool) SyncPlan
 
 // --------------------------------------------------------------------------------
 // validate.go contract

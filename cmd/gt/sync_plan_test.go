@@ -43,7 +43,7 @@ func TestBuildSyncPlan_TrunkFastForward(t *testing.T) {
 				"main": {Branch: "main", Exists: true, RemoteSHA: tc.remoteSHA},
 			}, nil)
 
-			plan := BuildSyncPlan(repo, snap)
+			plan := BuildSyncPlan(repo, snap, nil, nil)
 
 			if plan.Trunk.Branch != "main" {
 				t.Fatalf("Trunk.Branch = %q, want main", plan.Trunk.Branch)
@@ -79,7 +79,7 @@ func TestBuildSyncPlan_RepoWideIteratesAllStacks(t *testing.T) {
 		"feat/c": {Branch: "feat/c", Exists: true, RemoteSHA: "sha-c"},
 	}, nil)
 
-	plan := BuildSyncPlan(repo, snap)
+	plan := BuildSyncPlan(repo, snap, nil, nil)
 
 	if len(plan.Stacks) != 2 {
 		t.Fatalf("Stacks len = %d, want 2 (one per stack, repo-wide)", len(plan.Stacks))
@@ -101,36 +101,30 @@ func TestBuildSyncPlan_RepoWideIteratesAllStacks(t *testing.T) {
 	}
 }
 
-func TestBuildSyncPlan_StaleBranchMissingRemoteNoPR(t *testing.T) {
+func TestBuildSyncPlan_FinishedStack(t *testing.T) {
 	repo := repoWithStacks(trackedStack{
 		Trunk: trackedBranch{Branch: "main", Head: "sha-main"},
 		Branches: []trackedBranch{
-			{Branch: "feat/alive"},
-			{Branch: "feat/gone"},
+			{Branch: "feat/a"},
+			{Branch: "feat/b"},
 		},
 	})
-	snap := snapWith(
-		map[string]RemoteRef{
-			"main":       {Branch: "main", Exists: true, RemoteSHA: "sha-main"},
-			"feat/alive": {Branch: "feat/alive", Exists: true, RemoteSHA: "sha-alive"},
-			// feat/gone deliberately absent: remote ref no longer exists.
-		},
-		map[string]PRSnapshot{
-			// feat/gone has no open PR.
-			"feat/alive": {Number: 1, Head: "feat/alive", State: "OPEN"},
-		},
-	)
+	snap := snapWith(nil, map[string]PRSnapshot{
+		"feat/a": {Number: 1, Head: "feat/a", State: "MERGED"},
+		"feat/b": {Number: 2, Head: "feat/b", State: "CLOSED"},
+	})
+	groups := [][]localBranch{{
+		{name: "feat/a", local: true},
+		{name: "feat/b", local: true},
+	}}
 
-	plan := BuildSyncPlan(repo, snap)
+	plan := BuildSyncPlan(repo, snap, groups, map[string]bool{"main": true})
 
-	if len(plan.Stale) != 1 {
-		t.Fatalf("Stale len = %d, want 1; got %+v", len(plan.Stale), plan.Stale)
+	if len(plan.Stale) != 2 {
+		t.Fatalf("Stale len = %d, want 2; got %+v", len(plan.Stale), plan.Stale)
 	}
-	if plan.Stale[0].name != "feat/gone" {
-		t.Errorf("Stale[0].name = %q, want feat/gone", plan.Stale[0].name)
-	}
-	if plan.Stale[0].reason == "" {
-		t.Errorf("Stale[0].reason empty, want a reason string")
+	if plan.Stale[0].name != "feat/a" || plan.Stale[1].name != "feat/b" {
+		t.Errorf("Stale = %+v, want feat/a then feat/b", plan.Stale)
 	}
 }
 
@@ -138,7 +132,7 @@ func TestBuildSyncPlan_EmptyRepoEmptyPlan(t *testing.T) {
 	repo := &repoStackState{}
 	snap := snapWith(map[string]RemoteRef{}, nil)
 
-	plan := BuildSyncPlan(repo, snap)
+	plan := BuildSyncPlan(repo, snap, nil, nil)
 
 	if plan.Trunk.Branch != "" {
 		t.Errorf("Trunk.Branch = %q, want empty for empty repo", plan.Trunk.Branch)
@@ -161,7 +155,7 @@ func TestBuildSyncPlan_TrunkFastForwardFalseWhenRemoteMissing(t *testing.T) {
 		"feat/a": {Branch: "feat/a", Exists: true, RemoteSHA: "sha-a"},
 	}, nil)
 
-	plan := BuildSyncPlan(repo, snap)
+	plan := BuildSyncPlan(repo, snap, nil, nil)
 
 	if plan.Trunk.Branch != "main" {
 		t.Fatalf("Trunk.Branch = %q, want main", plan.Trunk.Branch)
@@ -183,7 +177,7 @@ func TestBuildSyncPlan_NilSnapIsSafe(t *testing.T) {
 		Branches: []trackedBranch{{Branch: "feat/a"}},
 	})
 
-	plan := BuildSyncPlan(repo, nil)
+	plan := BuildSyncPlan(repo, nil, nil, nil)
 
 	if plan.Trunk.FastForward {
 		t.Errorf("Trunk.FastForward = true, want false with nil snap")
@@ -199,7 +193,7 @@ func TestBuildSyncPlan_NilSnapIsSafe(t *testing.T) {
 // TestBuildSyncPlan_NilRepoIsSafe guards the pure entry point against a nil
 // repo: it must return a zero plan rather than panic.
 func TestBuildSyncPlan_NilRepoIsSafe(t *testing.T) {
-	plan := BuildSyncPlan(nil, snapWith(map[string]RemoteRef{}, nil))
+	plan := BuildSyncPlan(nil, snapWith(map[string]RemoteRef{}, nil), nil, nil)
 
 	if plan.Trunk.Branch != "" {
 		t.Errorf("Trunk.Branch = %q, want empty for nil repo", plan.Trunk.Branch)
@@ -212,59 +206,28 @@ func TestBuildSyncPlan_NilRepoIsSafe(t *testing.T) {
 	}
 }
 
-// TestBuildSyncPlan_StaleDedupesAcrossStacks ensures a branch claimed by two
-// stacks is listed as stale once, not once per claim.
-func TestBuildSyncPlan_StaleDedupesAcrossStacks(t *testing.T) {
-	repo := repoWithStacks(
-		trackedStack{
-			Trunk:    trackedBranch{Branch: "main", Head: "sha-main"},
-			Branches: []trackedBranch{{Branch: "feat/dup"}},
-		},
-		trackedStack{
-			Trunk:    trackedBranch{Branch: "main", Head: "sha-main"},
-			Branches: []trackedBranch{{Branch: "feat/dup"}},
-		},
-	)
-	snap := snapWith(map[string]RemoteRef{
-		"main": {Branch: "main", Exists: true, RemoteSHA: "sha-main"},
-	}, nil)
-
-	plan := BuildSyncPlan(repo, snap)
-
-	if len(plan.Stale) != 1 {
-		t.Fatalf("Stale len = %d, want 1 (deduped); got %+v", len(plan.Stale), plan.Stale)
-	}
-	if plan.Stale[0].name != "feat/dup" {
-		t.Errorf("Stale[0].name = %q, want feat/dup", plan.Stale[0].name)
-	}
-}
-
-// TestBuildSyncPlan_StaleSkipsBranchWithOpenPR ensures a branch missing on
-// remote but with an OPEN PR is not marked stale.
-func TestBuildSyncPlan_StaleSkipsBranchWithOpenPR(t *testing.T) {
+// TestBuildSyncPlan_OpenBranchKeepsChain ensures one open pull request keeps
+// every branch on that stack, including a merged one.
+func TestBuildSyncPlan_OpenBranchKeepsChain(t *testing.T) {
 	repo := repoWithStacks(trackedStack{
 		Trunk: trackedBranch{Branch: "main", Head: "sha-main"},
 		Branches: []trackedBranch{
-			{Branch: "feat/pr-open"},
-			{Branch: "feat/no-pr"},
+			{Branch: "feat/merged"},
+			{Branch: "feat/open"},
 		},
 	})
-	snap := snapWith(
-		map[string]RemoteRef{
-			"main": {Branch: "main", Exists: true, RemoteSHA: "sha-main"},
-			// both feat branches absent on remote
-		},
-		map[string]PRSnapshot{
-			"feat/pr-open": {Number: 7, Head: "feat/pr-open", State: "OPEN"},
-		},
-	)
+	snap := snapWith(nil, map[string]PRSnapshot{
+		"feat/merged": {Number: 1, Head: "feat/merged", State: "MERGED"},
+		"feat/open":   {Number: 2, Head: "feat/open", State: "OPEN"},
+	})
+	groups := [][]localBranch{{
+		{name: "feat/merged", local: true},
+		{name: "feat/open", local: true},
+	}}
 
-	plan := BuildSyncPlan(repo, snap)
+	plan := BuildSyncPlan(repo, snap, groups, map[string]bool{"main": true})
 
-	if len(plan.Stale) != 1 {
-		t.Fatalf("Stale len = %d, want 1; got %+v", len(plan.Stale), plan.Stale)
-	}
-	if plan.Stale[0].name != "feat/no-pr" {
-		t.Errorf("Stale[0].name = %q, want feat/no-pr", plan.Stale[0].name)
+	if len(plan.Stale) != 0 {
+		t.Fatalf("Stale len = %d, want 0; got %+v", len(plan.Stale), plan.Stale)
 	}
 }

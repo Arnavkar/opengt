@@ -29,27 +29,10 @@ type staleBranch struct {
 	reason string
 }
 
-// pruneStaleBranches deletes a stack only when every branch in it has a pull
-// request and every one of those pull requests is merged or closed. A stack
-// that still has an open PR, or a branch with no PR, is left intact — merged
-// branches stay in the stack so restack and `gh stack view` keep the full
-// chain. gh stack --prune deletes local branches for merged PRs but keeps
-// that metadata; gt goes one step further and does not delete those branches
-// until the whole stack is finished.
-//
-// PR state comes from snap (loaded once by LoadRemoteSnapshot). A missing
-// snapshot does not delete anything: gone remotes alone are not a finished
-// stack.
-func pruneStaleBranches(snap *RemoteSnapshot, deleteAll bool) (bool, error) {
-	groups, err := listTrackedStackGroups()
-	if err != nil {
-		return false, err
-	}
-	prs, prsAvailable := prsFromSnapshot(snap)
-	if !prsAvailable {
-		fmt.Fprintf(os.Stderr, "gt: no pull request snapshot available; leaving stacks in place\n")
-	}
-	stale := finishedStackBranches(groups, prs, trunkNames(), prsAvailable)
+// pruneStaleBranches deletes the finished stacks named by the sync plan.
+// The prompt, the paused-operation check, and git deletion stay here.
+// An empty list deletes nothing.
+func pruneStaleBranches(stale []staleBranch, groups [][]localBranch, deleteAll bool) (bool, error) {
 	if len(stale) == 0 {
 		return false, nil
 	}
