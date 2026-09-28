@@ -423,10 +423,6 @@ func loadRepoStacks() (*repoStackState, error) {
 	if err := requireGhStack(); err != nil {
 		return nil, err
 	}
-	if len(sources) == 0 {
-		repo := reconcileSources(nil)
-		return &repo, nil
-	}
 	for _, src := range sources {
 		if se, ok := src.ReadErr.(*schemaError); ok {
 			return nil, se
@@ -438,6 +434,10 @@ func loadRepoStacks() (*repoStackState, error) {
 		}
 	}
 	repo := reconcileSources(sources)
+	// gh-stack may track the current branch in a state file gt does not read
+	// (a linked worktree's copy). Ask gh before reporting it as untracked.
+	current, _ := currentBranch()
+	adoptGhStack(&repo, current)
 	return &repo, nil
 }
 

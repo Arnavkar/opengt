@@ -427,7 +427,8 @@ func parseWorktreeBranchPaths(out string) map[string]string {
 // those per-worktree copies on purpose: unioning them is what produced
 // cross-worktree surprises (duplicated stacks, conflicting definitions, state
 // copied between worktrees). The repo-root file is the single source of
-// truth.
+// truth. When it does not place the current branch in a stack, adoptGhStack
+// asks `gh stack view` instead of unioning files (see stack_view.go).
 func gitStackDir() (string, error) {
 	return capture("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
 }

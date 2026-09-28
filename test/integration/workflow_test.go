@@ -760,6 +760,53 @@ func TestLinkedWorktreeSharesRepoRootState(t *testing.T) {
 	}
 }
 
+// TestLinkedWorktreeGhStackInitIsAdopted covers the failure `gh stack init`
+// itself causes: run in a linked worktree, it writes its stack to that
+// worktree's state file under .git/worktrees/<name>, which gt does not read.
+// Before the branch is asked about, gt asks `gh stack view`, which resolves
+// gh's own state path, so the branch is recognized as tracked: `gt track`
+// refuses instead of re-running `gh stack init`, and `gt modify` works.
+func TestLinkedWorktreeGhStackInitIsAdopted(t *testing.T) {
+	f := newFixture(t)
+	f.layer("layer-one", "Add layer one")
+	f.gt("trunk")
+
+	linked := f.dir + "-worktree"
+	f.git("worktree", "add", "--quiet", "-b", "layer-two", linked, "main")
+	worktree := &fixture{t: t, dir: linked, origin: f.origin}
+	worktree.write("layer-two.txt", "layer two\n")
+	worktree.run("git", "add", "-A")
+	worktree.run("git", "commit", "--quiet", "-m", "Add layer two")
+
+	// Track the branch the way raw `gh stack` does, from inside the worktree.
+	if r := worktree.run("gh", "stack", "init", "--base", "main", "layer-two"); r.code != 0 {
+		t.Fatalf("gh stack init in the worktree exited %d\n%s", r.code, r.output())
+	}
+	// The stack must exist only in the worktree's own state file.
+	if _, err := os.Stat(filepath.Join(f.dir, ".git", "gh-stack")); err == nil {
+		if names := f.tracked(); len(names) != 1 || names[0] != "layer-one" {
+			t.Errorf("repo-root state now tracks %v, want [layer-one]", names)
+		}
+	}
+
+	// gt track must recognize the adopted stack instead of handing the branch
+	// to `gh stack init`, which would refuse with its own error.
+	r := worktree.gtFails("track")
+	if !strings.Contains(r.stderr, "is already in a stack") {
+		t.Errorf("gt track error = %q, want the adoption message", r.stderr)
+	}
+	if r.announced("gh stack init") {
+		t.Errorf("gt track ran gh stack init for an adopted branch\n%s", r.output())
+	}
+
+	// gt modify on the adopted branch must get past the position check.
+	worktree.write("more.txt", "more\n")
+	worktree.gt("modify", "-a", "-m", "Extend layer two")
+	if got := worktree.subject("HEAD"); got != "Extend layer two" {
+		t.Errorf("HEAD subject = %q, want the amended message", got)
+	}
+}
+
 // skipNoGitHub is defined in bench_test.go; the submit tests below reuse it to
 // gate on a real GitHub remote + token.
 

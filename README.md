@@ -185,7 +185,13 @@ Exit codes:
 file, so sync from one worktree is visible everywhere and worktrees cannot
 disagree about stack order. `gh stack` itself may still write a per-worktree
 copy under `.git/worktrees/<name>` when its own commands run in a linked
-worktree; `gt` deliberately ignores those copies.
+worktree; `gt` deliberately ignores those copies when reading state.
+
+When the repo-root file does not place the current branch in any stack, `gt`
+asks `gh stack view --json` before declaring it untracked. gh resolves its own
+state path, so a stack that only exists in a linked worktree is still
+recognized. This is a fallback: a branch gt already tracks locally always wins,
+and the adopted stack is persisted back to the repo-root file on the next write.
 
 ## Pinning `gh-stack`
 
