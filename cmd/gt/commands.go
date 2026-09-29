@@ -61,7 +61,13 @@ func cmdCreate(args []string) error {
 	message := joinMessage(*msg)
 	name := ""
 	if fs.NArg() > 0 {
-		name = fs.Arg(0)
+		// Everything after `gt create` is one string: `gt create fix the bug`
+		// is `gt create 'fix the bug'`. Single words pass through untouched;
+		// anything with spaces becomes an underscore slug.
+		name = strings.Join(fs.Args(), " ")
+		if strings.Contains(name, " ") {
+			name = slug(name)
+		}
 	} else if message != "" {
 		name = branchNameFrom(message, time.Now().Format("01-02"))
 	} else {

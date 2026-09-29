@@ -583,12 +583,12 @@ func joinMessage(parts []string) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// branchNameFrom builds a branch name from a commit message, matching the
-// MM-DD-slug shape that `gh stack add -m` generates.
-func branchNameFrom(msg, date string) string {
+// slug lowercases the string and turns each run of non-alphanumeric
+// characters into a single underscore.
+func slug(s string) string {
 	var b strings.Builder
 	prevUnderscore := false
-	for _, r := range strings.ToLower(msg) {
+	for _, r := range strings.ToLower(s) {
 		switch {
 		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
 			b.WriteRune(r)
@@ -600,9 +600,14 @@ func branchNameFrom(msg, date string) string {
 			}
 		}
 	}
-	slug := strings.Trim(b.String(), "_")
-	if slug == "" {
-		slug = "branch"
+	if s := strings.Trim(b.String(), "_"); s != "" {
+		return s
 	}
-	return date + "-" + slug
+	return "branch"
+}
+
+// branchNameFrom builds a branch name from a commit message, matching the
+// MM-DD-slug shape that `gh stack add -m` generates.
+func branchNameFrom(msg, date string) string {
+	return date + "-" + slug(msg)
 }

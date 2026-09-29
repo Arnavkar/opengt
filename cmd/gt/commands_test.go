@@ -52,3 +52,18 @@ func TestIgnorableStackSyncError(t *testing.T) {
 		t.Error("a real sync failure must not be ignored")
 	}
 }
+
+func TestSlug(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"mybranch", "mybranch"},
+		{"fix the login bug", "fix_the_login_bug"},
+		{"  trim   me  ", "trim_me"},
+		{"", "branch"},
+		{"!!!", "branch"},
+	}
+	for _, tt := range tests {
+		if got := slug(tt.in); got != tt.want {
+			t.Errorf("slug(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
