@@ -13,8 +13,10 @@ import (
 // gh-stack-compat workflow runs the same tests against `latest` as an
 // early warning and must not be treated as the version developers run.
 var ghStackCompat = GhStackCompatibility{
-	MinVersion:     Version{0, 1, 0},
-	TestedVersion:  Version{0, 1, 1},
+	// 0.2.0 is the floor: it introduced the single shared catalog gt reads,
+	// so older per-worktree tracking predates gt's whole state model.
+	MinVersion:     Version{0, 2, 0},
+	TestedVersion:  Version{0, 2, 0},
 	SchemaVersions: []int{1},
 	StateFileName:  "gh-stack",
 }

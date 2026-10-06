@@ -12,7 +12,10 @@ func TestMeasureRecordsSpan(t *testing.T) {
 	var tm Timer
 	tm.Enabled = true
 
-	err := tm.Measure("step", func() error { return nil })
+	// The sleep must exist: on some machines the monotonic clock cannot tell
+	// a no-op span from zero, so measuring time.Sleep is the only way this
+	// test means "the clock moved" everywhere.
+	err := tm.Measure("step", func() error { time.Sleep(time.Millisecond); return nil })
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

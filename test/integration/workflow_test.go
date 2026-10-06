@@ -693,12 +693,10 @@ func TestUnknownCommandPassesToGit(t *testing.T) {
 	}
 }
 
-// TestLinkedWorktree covers both sides of a case gt cannot fix on its own.
-//
-// gt prefers `--git-dir` (the worktree's own gh-stack file) and falls back to
-// `--git-common-dir` when this checkout has not written one yet. A stack
-// created in the main repository must still be visible from a linked worktree
-// so `gt create` does not run `gh stack init` and start a second stack.
+// TestLinkedWorktree: gt reads the one catalog shared by every worktree
+// (gh-stack 0.2.0 keeps state at the common git dir). A stack created in the
+// main repository must still be visible from a linked worktree so `gt create`
+// does not run `gh stack init` and start a second stack.
 func TestLinkedWorktree(t *testing.T) {
 	f := newFixture(t)
 	f.layer("layer-one", "Add layer one")
@@ -717,9 +715,9 @@ func TestLinkedWorktree(t *testing.T) {
 
 // TestLinkedWorktreeSharesRepoRootState: gt reads and writes gh-stack state
 // only at the repo root (the shared git dir). Commands run from a linked
-// worktree must see and update that one file, must not create their own copy
-// under .git/worktrees/<name>, and must ignore per-worktree copies that
-// `gh stack` itself may have planted there.
+// worktree must see and update that one file and must ignore pre-0.2.0
+// per-worktree catalogs left behind under .git/worktrees/<name> — while
+// `gt doctor` warns that the legacy file exists.
 func TestLinkedWorktreeSharesRepoRootState(t *testing.T) {
 	f := newFixture(t)
 	f.layer("layer-one", "Add layer one")
@@ -747,8 +745,8 @@ func TestLinkedWorktreeSharesRepoRootState(t *testing.T) {
 		t.Errorf("repo-root state tracks %v after worktree sync -d, want [layer-one layer-two]", got)
 	}
 
-	// A per-worktree state file (which gh stack writes when its own commands
-	// run in a linked worktree) must not leak into gt's view of the stacks.
+	// A pre-0.2.0 per-worktree catalog must not leak into gt's view of the
+	// stacks, and `gt doctor` must flag it as un-migrated legacy state.
 	plant := linked + "-planted"
 	f.git("worktree", "add", "--quiet", "--detach", plant, "main")
 	os.WriteFile(filepath.Join(f.dir, ".git", "worktrees", filepath.Base(plant), "gh-stack"),
@@ -758,15 +756,31 @@ func TestLinkedWorktreeSharesRepoRootState(t *testing.T) {
 	if got := f.tracked(); len(got) != 2 || got[0] != "layer-one" || got[1] != "layer-two" {
 		t.Errorf("per-worktree state leaked into gt's view: %v, want [layer-one layer-two]", got)
 	}
+	dr := worktree.run(gtBin, "doctor", "--json")
+	var report struct {
+		Issues []struct {
+			Code string `json:"code"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal([]byte(dr.stdout), &report); err != nil {
+		t.Fatalf("doctor --json unparseable: %v\n%s", err, dr.stdout)
+	}
+	var sawLegacy bool
+	for _, iss := range report.Issues {
+		if iss.Code == "LEGACY_STATE_UNMIGRATED" {
+			sawLegacy = true
+		}
+	}
+	if !sawLegacy {
+		t.Errorf("doctor did not report LEGACY_STATE_UNMIGRATED for the planted catalog\nissues: %+v", report.Issues)
+	}
 }
 
-// TestLinkedWorktreeGhStackInitIsAdopted covers the failure `gh stack init`
-// itself causes: run in a linked worktree, it writes its stack to that
-// worktree's state file under .git/worktrees/<name>, which gt does not read.
-// Before the branch is asked about, gt asks `gh stack view`, which resolves
-// gh's own state path, so the branch is recognized as tracked: `gt track`
-// refuses instead of re-running `gh stack init`, and `gt modify` works.
-func TestLinkedWorktreeGhStackInitIsAdopted(t *testing.T) {
+// TestLinkedWorktreeGhStackInitSharesCatalog: gh-stack 0.2.0 keeps one
+// catalog per repository. `gh stack init` run in a linked worktree writes to
+// that shared catalog (no file under .git/worktrees/<name>), so gt sees the
+// new stack immediately from every worktree — no adoption fallback needed.
+func TestLinkedWorktreeGhStackInitSharesCatalog(t *testing.T) {
 	f := newFixture(t)
 	f.layer("layer-one", "Add layer one")
 	f.gt("trunk")
@@ -782,24 +796,25 @@ func TestLinkedWorktreeGhStackInitIsAdopted(t *testing.T) {
 	if r := worktree.run("gh", "stack", "init", "--base", "main", "layer-two"); r.code != 0 {
 		t.Fatalf("gh stack init in the worktree exited %d\n%s", r.code, r.output())
 	}
-	// The stack must exist only in the worktree's own state file.
-	if _, err := os.Stat(filepath.Join(f.dir, ".git", "gh-stack")); err == nil {
-		if names := f.tracked(); len(names) != 1 || names[0] != "layer-one" {
-			t.Errorf("repo-root state now tracks %v, want [layer-one]", names)
-		}
+	if _, err := os.Stat(filepath.Join(f.dir, ".git", "worktrees", filepath.Base(linked), "gh-stack")); err == nil {
+		t.Error("gh stack wrote a per-worktree catalog; since 0.2.0 it must share the repo-root file")
+	}
+	// Both stacks (the fixture's and the worktree's) live in the shared file.
+	st := f.state()
+	if len(st.Stacks) != 2 {
+		t.Fatalf("shared catalog has %d stacks, want 2: %+v", len(st.Stacks), st.Stacks)
 	}
 
-	// gt track must recognize the adopted stack instead of handing the branch
-	// to `gh stack init`, which would refuse with its own error.
+	// gt sees the worktree-tracked branch without any `gh stack` round-trip.
 	r := worktree.gtFails("track")
 	if !strings.Contains(r.stderr, "is already in a stack") {
-		t.Errorf("gt track error = %q, want the adoption message", r.stderr)
+		t.Errorf("gt track error = %q, want the already-tracked message", r.stderr)
 	}
 	if r.announced("gh stack init") {
-		t.Errorf("gt track ran gh stack init for an adopted branch\n%s", r.output())
+		t.Errorf("gt track ran gh stack init for a tracked branch\n%s", r.output())
 	}
 
-	// gt modify on the adopted branch must get past the position check.
+	// gt modify on the worktree branch must get past the position check.
 	worktree.write("more.txt", "more\n")
 	worktree.gt("modify", "-a", "-m", "Extend layer two")
 	if got := worktree.subject("HEAD"); got != "Extend layer two" {

@@ -434,10 +434,6 @@ func loadRepoStacks() (*repoStackState, error) {
 		}
 	}
 	repo := reconcileSources(sources)
-	// gh-stack may track the current branch in a state file gt does not read
-	// (a linked worktree's copy). Ask gh before reporting it as untracked.
-	current, _ := currentBranch()
-	adoptGhStack(&repo, current)
 	return &repo, nil
 }
 

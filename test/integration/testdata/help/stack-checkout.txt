@@ -43,4 +43,5 @@ Examples:
   $ gh stack checkout
 
 Flags:
-  -h, --help   help for checkout
+  -h, --help         help for checkout
+      --print-path   Print the target worktree path (requires an explicit target)

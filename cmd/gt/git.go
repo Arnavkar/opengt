@@ -420,15 +420,10 @@ func parseWorktreeBranchPaths(out string) map[string]string {
 
 // gitStackDir is the directory gt reads and writes the `gh-stack` state file
 // from: the shared repository directory (`--git-common-dir`), i.e. the repo
-// root. One file, shared by every worktree.
-//
-// gh stack itself resolves the state path per git-dir, so a command run in a
-// linked worktree can create `.git/worktrees/<name>/gh-stack`. gt ignores
-// those per-worktree copies on purpose: unioning them is what produced
-// cross-worktree surprises (duplicated stacks, conflicting definitions, state
-// copied between worktrees). The repo-root file is the single source of
-// truth. When it does not place the current branch in a stack, adoptGhStack
-// asks `gh stack view` instead of unioning files (see stack_view.go).
+// root. Since gh-stack 0.2.0 upstream keeps its catalog in the same place,
+// so gt and gh stack read one file, shared by every worktree. If a repo
+// still has pre-0.2.0 per-worktree copies under `.git/worktrees/<name>`, they
+// are stale until `gh stack` migrates them; `gt doctor` reports that.
 func gitStackDir() (string, error) {
 	return capture("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
 }
@@ -452,9 +447,8 @@ func gitStackFiles() ([]string, error) {
 }
 
 // listStackLocations is every git-dir gt reads gh-stack state from: only the
-// shared repository directory. Per-worktree state files (which gh stack may
-// write when a command runs in a linked worktree) are deliberately not
-// listed; see gitStackDir.
+// shared repository directory, where gh-stack 0.2.0+ keeps its single
+// catalog. See gitStackDir.
 func listStackLocations() ([]stackLocation, error) {
 	common, err := capture("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {

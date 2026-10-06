@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -161,5 +163,68 @@ func TestMergeStacksDedupesIdentical(t *testing.T) {
 	mergeStacks(dst, src)
 	if len(dst.Stacks) != 1 {
 		t.Fatalf("got %d stacks, want 1", len(dst.Stacks))
+	}
+}
+
+func TestScanMarkerDirs(t *testing.T) {
+	d1, d2 := t.TempDir(), t.TempDir()
+	if scanMarkerDirs([]string{d1, d2}) != "" {
+		t.Fatal("no markers, want no op")
+	}
+	// 0.2.0's cross-worktree modify uses a worktree-suffixed marker name.
+	write := func(dir, name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(d2, "gh-stack-modify-state_wt1")
+	if got := scanMarkerDirs([]string{d1, d2}); got != "modify" {
+		t.Fatalf("suffixed modify marker: got %q", got)
+	}
+	write(d1, "gh-stack-rebase-state")
+	if got := scanMarkerDirs([]string{d1, d2}); got != "rebase" {
+		t.Fatalf("plain rebase marker in first dir wins: got %q", got)
+	}
+	// Locks and backups are not markers.
+	d3 := t.TempDir()
+	write(d3, "gh-stack.lock")
+	write(d3, "gh-stack-modify-stateful.bak")
+	if got := scanMarkerDirs([]string{d3}); got != "" {
+		t.Fatalf("non-marker files must not match: got %q", got)
+	}
+}
+
+func TestWriteStackFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gh-stack")
+	st := stateFrom(t, linearStack)
+	if err := writeStackFile(path, st); err != nil {
+		t.Fatal(err)
+	}
+	back, err := readStackFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(back.Stacks) != 1 || back.Stacks[0].Branches[0].Branch != "a" {
+		t.Fatalf("round trip: %+v", back.Stacks)
+	}
+	// No temp or lock debris besides the interop lock gt holds during writes.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, e := range entries {
+		names[e.Name()] = true
+	}
+	delete(names, "gh-stack")
+	delete(names, "gh-stack.lock")
+	if len(names) != 0 {
+		t.Fatalf("unexpected files after write: %v", names)
+	}
+	// An unwritable target surfaces an error, never a silently skipped write.
+	if err := writeStackFile(filepath.Join(dir, "missing", "gh-stack"), st); err == nil {
+		t.Fatal("want error for unwritable path")
 	}
 }

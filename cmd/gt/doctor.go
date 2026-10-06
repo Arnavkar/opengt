@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -164,6 +165,28 @@ func runDoctor(repair, yes, asJSON bool) doctorReport {
 	wtRows := worktreeRows(sources)
 	rep.Worktrees = wtRows
 	rep.Repository["worktrees"] = len(wtRows)
+
+	// A blocked pre-0.2.0 migration leaves per-worktree catalogs behind while
+	// gh-stack stops short of migrating them; gt reads only the shared file,
+	// so without this check it would silently see stale state.
+	if dir, derr := gitStackDir(); derr == nil {
+		if legacy := legacyCatalogPaths(dir); len(legacy) > 0 {
+			rep.Issues = append(rep.Issues, stackIssue{
+				Code: "LEGACY_STATE_UNMIGRATED", Severity: "warning",
+				Message: "pre-0.2.0 gh-stack state files remain per worktree: " + strings.Join(legacy, ", ") +
+					"\ngt ignores them, but they may hold state gh-stack has not migrated. " +
+					"Run `gh stack view` to trigger migration, or delete the files.",
+			})
+		}
+	}
+	if len(wtRows) > 1 {
+		if gv, ok := localGitVersion(); ok && gv.below(Version{2, 36, 0}) {
+			rep.Issues = append(rep.Issues, stackIssue{
+				Code: "GIT_TOO_OLD", Severity: "warning",
+				Message: fmt.Sprintf("cross-worktree gh-stack operations need git >= 2.36; found git %s", gv),
+			})
+		}
+	}
 
 	localHeads, localErr := localBranchHeads()
 	if localErr != nil {
@@ -633,6 +656,29 @@ func doctorExitFrom(issues []stackIssue) int {
 	default:
 		return exitDoctorHealthy
 	}
+}
+
+// legacyCatalogPaths lists gh-stack 0.1.x per-worktree catalogs left under
+// the shared git dir. 0.2.0 migrated state tracking into the shared catalog;
+// anything here predates the migration and is ignored by both gt and (post-
+// migration) gh-stack.
+func legacyCatalogPaths(commonDir string) []string {
+	matches, err := filepath.Glob(filepath.Join(commonDir, "worktrees", "*", ghStackCompat.StateFileName))
+	if err != nil {
+		return nil
+	}
+	return matches
+}
+
+// localGitVersion runs `git version` and parses the x.y.z out of its output
+// ("git version 2.39.5 (Apple Git-154)"). ok is false when parse fails, in
+// which case the caller skips the check rather than warning on a guess.
+func localGitVersion() (Version, bool) {
+	out, err := capture("git", "version")
+	if err != nil {
+		return Version{}, false
+	}
+	return parseGhStackVersion(out)
 }
 
 func formatDoctor(rep doctorReport) string {

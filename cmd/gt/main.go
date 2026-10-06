@@ -96,6 +96,11 @@ var unsupported = map[string]string{
 }
 
 func main() {
+	// gh-stack's own release notifier fires from within `gh stack` child
+	// processes; gt has its own version warning, so silence theirs.
+	if os.Getenv("GH_STACK_NO_UPDATE_NOTIFIER") == "" {
+		_ = os.Setenv("GH_STACK_NO_UPDATE_NOTIFIER", "1")
+	}
 	args := os.Args[1:]
 	if len(args) == 0 {
 		printHelp()

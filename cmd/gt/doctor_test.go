@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestCheckStackRemoteSkipsMissingAndContinues(t *testing.T) {
 	stack := trackedStack{
@@ -53,5 +57,23 @@ func TestDoctorRemoteFailureExit(t *testing.T) {
 		Code: "REMOTE_CHECK_FAILED", Severity: "error",
 	}}) != exitDoctorDependency {
 		t.Fatal("remote failure must use dependency exit")
+	}
+}
+
+func TestLegacyCatalogPaths(t *testing.T) {
+	dir := t.TempDir()
+	if got := legacyCatalogPaths(dir); len(got) != 0 {
+		t.Fatalf("no worktrees: %v", got)
+	}
+	wt := filepath.Join(dir, "worktrees", "feature-x")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, ghStackCompat.StateFileName), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := legacyCatalogPaths(dir)
+	if len(got) != 1 || got[0] != filepath.Join(wt, ghStackCompat.StateFileName) {
+		t.Fatalf("want the per-worktree catalog, got %v", got)
 	}
 }

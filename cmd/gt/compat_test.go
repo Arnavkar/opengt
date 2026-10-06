@@ -3,12 +3,16 @@ package main
 import "testing"
 
 func TestParseGhStackVersion(t *testing.T) {
-	v, ok := parseGhStackVersion("gh stack version 0.1.0")
-	if !ok || v.String() != "0.1.0" {
+	v, ok := parseGhStackVersion("gh stack version 0.2.0")
+	if !ok || v.String() != "0.2.0" {
 		t.Fatalf("got %v ok=%v", v, ok)
 	}
 	if v.below(ghStackCompat.MinVersion) {
-		t.Fatal("0.1.0 should not be below min")
+		t.Fatal("0.2.0 should not be below min")
+	}
+	old, _ := parseGhStackVersion("0.1.1")
+	if !old.below(ghStackCompat.MinVersion) {
+		t.Fatal("0.1.1 should be below min")
 	}
 	newer, _ := parseGhStackVersion("1.2.3")
 	if !newer.above(ghStackCompat.TestedVersion) {

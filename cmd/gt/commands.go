@@ -843,8 +843,8 @@ func didMove(branch, oldSHA string) bool {
 	return now != oldSHA
 }
 
-// persistSyncState writes the reconciled repo state back to this worktree's
-// gh-stack file. It is called once at the end of sync when a local ref moved.
+// persistSyncState writes the reconciled repo state back to the shared
+// gh-stack catalog. It is called once at the end of sync when a local ref moved.
 func persistSyncState(repo *repoStackState) error {
 	dir, err := gitStackDir()
 	if err != nil {

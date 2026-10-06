@@ -14,7 +14,7 @@ legacy `gh stack` implementation with `--native`.
 
 > [!IMPORTANT]
 > `opengt` is early software. It currently supports **linear stacks only** and
-> targets `gh-stack` **v0.1.1**, state schema **v1**. When an operation cannot
+> targets `gh-stack` **v0.2.0**, state schema **v1**. When an operation cannot
 > be translated safely, it stops with an actionable error instead of guessing.
 
 ## Quick start
@@ -180,27 +180,30 @@ Exit codes:
 
 ### One state file, at the repo root
 
-`gt` reads and writes gh-stack state only at the shared repository directory
-(`.git/gh-stack`), never per worktree. Every worktree sees and updates the same
-file, so sync from one worktree is visible everywhere and worktrees cannot
-disagree about stack order. `gh stack` itself may still write a per-worktree
-copy under `.git/worktrees/<name>` when its own commands run in a linked
-worktree; `gt` deliberately ignores those copies when reading state.
+Since gh-stack 0.2.0, both tools read and write one catalog at the shared
+repository directory (`.git/gh-stack`), never per worktree. Every worktree
+sees and updates the same file, so sync from one worktree is visible
+everywhere and worktrees cannot disagree about stack order. Writes are atomic
+and take gh-stack's interop lock (`gh-stack.lock`), so the two tools can
+never read a half-written file or clobber each other's edits.
 
-When the repo-root file does not place the current branch in any stack, `gt`
-asks `gh stack view --json` before declaring it untracked. gh resolves its own
-state path, so a stack that only exists in a linked worktree is still
-recognized. This is a fallback: a branch gt already tracks locally always wins,
-and the adopted stack is persisted back to the repo-root file on the next write.
+Repositories that ran gh-stack before 0.2.0 may still carry per-worktree
+catalogs under `.git/worktrees/<name>/gh-stack`. `gh stack` migrates those
+automatically on its next command; if a migration is blocked (conflicting
+definitions), `gt doctor` warns that those files remain and that gt is
+seeing only the — possibly stale — shared file.
+
+Minimum gh-stack version is **0.2.0**: the single shared catalog is the state
+model gt was written against.
 
 ## Pinning `gh-stack`
 
-This shim targets **v0.1.1** and schema **v1**. CI installs that pin
+This shim targets **v0.2.0** and schema **v1**. CI installs that pin
 (`.github/workflows/ci.yml`). The daily `gh-stack-compat` workflow tests
 `latest` as an early warning; it does not change what developers should run.
 
 ```sh
-gh extension install github/gh-stack --pin v0.1.1 --force
+gh extension install github/gh-stack --pin v0.2.0 --force
 ```
 
 A newer `gh-stack` with the same schema warns and continues. An unknown

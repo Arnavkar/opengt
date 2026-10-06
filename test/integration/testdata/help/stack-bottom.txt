@@ -9,4 +9,5 @@ Examples:
   $ gh stack bottom
 
 Flags:
-  -h, --help   help for bottom
+  -h, --help         help for bottom
+      --print-path   Print the target worktree path without switching a branch held elsewhere

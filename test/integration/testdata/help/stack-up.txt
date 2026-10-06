@@ -12,4 +12,5 @@ Examples:
   $ gh stack up 3
 
 Flags:
-  -h, --help   help for up
+  -h, --help         help for up
+      --print-path   Print the target worktree path without switching a branch held elsewhere

@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-// tracked* types match github/gh-stack v0.1.0 schema v1
+// tracked* types match github/gh-stack v0.2.0 schema v1
 // (internal/stack/schema.json). gt does not own this format.
 
 type pullRequestRef struct {
@@ -72,7 +73,39 @@ func writeStackFile(path string, st *stackState) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(out, '\n'), 0o644)
+	// gh-stack >= 0.2.0 shares this catalog with gt and assumes its writers
+	// are atomic (internal/stack/atomic.go) and hold its interop lock
+	// (internal/stack/lock.go). gt honors both: same-dir rename means a
+	// half-written file can never be read, and the flock means a gt write
+	// cannot clobber a concurrent gh-stack mutation.
+	unlock, err := withCatalogLock(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return writeFileAtomic(path, append(out, '\n'))
+}
+
+// writeFileAtomic writes data to path via a temp file in the same directory
+// and a rename, so readers only ever see whole files.
+func writeFileAtomic(path string, data []byte) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".gt-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	defer func() {
+		if cerr := tmp.Close(); err == nil && cerr != nil {
+			err = cerr
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func mergeStacks(dst, src *stackState) {
@@ -167,22 +200,41 @@ func errForked(branch string) error {
 }
 
 // pausedOperation reports which gh stack operation, if any, is halted waiting
-// for conflict resolution. gh stack drops a marker file per operation. Unlike
-// the stack state, markers follow gh stack's per-git-dir rule, so both this
-// worktree's git-dir and the shared repository directory are checked.
+// for conflict resolution. gh stack drops a marker file per operation. Both
+// this worktree's git-dir and the shared repository directory are checked:
+// since 0.2.0 markers live in the shared directory, and a marker left by an
+// older release sits in the worktree's own git-dir.
 func pausedOperation() (string, error) {
 	dirs, err := pausedMarkerDirs()
 	if err != nil {
 		return "", fmt.Errorf("not a git repository")
 	}
+	return scanMarkerDirs(dirs), nil
+}
+
+// scanMarkerDirs reports the first paused gh-stack operation with a marker in
+// dirs. A marker is the plain name (gh-stack-<op>-state) or its suffixed
+// variant: 0.2.0's cross-worktree modify drops gh-stack-modify-state_<wt>
+// beside it, and either form means a paused op.
+func scanMarkerDirs(dirs []string) string {
 	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
 		for _, op := range []string{"rebase", "modify"} {
-			if _, err := os.Stat(filepath.Join(dir, "gh-stack-"+op+"-state")); err == nil {
-				return op, nil
+			want := "gh-stack-" + op + "-state"
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				if n := e.Name(); n == want || strings.HasPrefix(n, want+"_") {
+					return op
+				}
 			}
 		}
 	}
-	return "", nil
+	return ""
 }
 
 // pausedMarkerDirs lists the git-dirs a paused-operation marker may live in:

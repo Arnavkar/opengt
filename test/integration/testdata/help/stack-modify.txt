@@ -8,6 +8,10 @@ Operations available:
   • Rename branches
 
 All changes are staged in the TUI and applied together when you press Ctrl+S.
+Branches may be checked out in different worktrees. Changes run in their clean
+owning worktrees; unoccupied branches use the initiating worktree. Foreign
+worktrees are never switched to different branches. Changes are never autostashed,
+and no worktrees are created or removed.
 If your changes affect branches with pull requests, run 'gh stack submit'
 afterward to push changes, update PRs, and recreate the stack on GitHub.
 

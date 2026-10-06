@@ -11,4 +11,5 @@ Examples:
   $ gh stack trunk
 
 Flags:
-  -h, --help   help for trunk
+  -h, --help         help for trunk
+      --print-path   Print the trunk worktree path without switching a branch held elsewhere
