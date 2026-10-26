@@ -1,0 +1,25 @@
+---
+description: Run the full integration suite before changing anything
+alwaysApply: true
+---
+
+# Full suite before changes
+
+Before editing this repo, run the integration tests and wait for them to
+pass. Do not start the change until they are green (or you have recorded a
+baseline failure you are about to fix).
+
+```sh
+go test -tags=integration -timeout 15m ./test/integration/
+```
+
+That builds `gt`, drives the real binary in throwaway repos with a bare
+git remote, and never prompts. Stdin is closed. No TTY pickers, no
+browser, no `gt-sandbox`.
+
+After the change, run the same command again. A change is not done until
+the second run is green.
+
+Do not substitute `go test ./...` (that skips the `integration` tag) or a
+single `-run` for this gate. GitHub-only submit/merge/get/pr tests stay
+skipped unless `GT_TEST_GITHUB=1`.

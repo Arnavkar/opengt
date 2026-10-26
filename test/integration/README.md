@@ -45,6 +45,7 @@ repository afterwards — branches, commits, rebase results, the state file:
 | Checkout routing | tracked branch, untracked branch, trunk, `-t` |
 | Conflicts | pause detection, `gt continue`, `gt abort` |
 | Refusals | unsupported Graphite commands, conflicting flags |
+| CLI surface | `gt --version`, `gt help`, `gt init`, `gt get` with no args, `gt submit --dry-run` |
 
 `contract_test.go` pins the parts of the `gh stack` interface `gt` depends on:
 

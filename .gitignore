@@ -4,3 +4,6 @@ dist/
 # `go build ./...` drops the binary here. Anchored: a bare `gt` would match
 # the cmd/gt source directory too.
 /gt
+
+# Verification transcripts. The skill and helper stay in git; runs do not.
+.cursor/skills/verify-gt/evidence/
