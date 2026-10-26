@@ -155,6 +155,9 @@ type RestackOpts struct {
 	// Merged branches are left at their current SHA. The stack order is
 	// unchanged, so the branch above still rebases onto the merged branch.
 	Merged map[string]bool
+	// PauseOnConflict leaves git's rebase state in place so gt continue
+	// can resume it. Sync and submit keep the default rollback.
+	PauseOnConflict bool
 }
 
 // CascadeRestack rebases each branch onto its parent in stack order, returning

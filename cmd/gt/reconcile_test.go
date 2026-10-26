@@ -10,6 +10,15 @@ func src(t *testing.T, path, jsonText string) stackStateSource {
 	return stackStateSource{Path: path, State: stateFrom(t, jsonText)}
 }
 
+func TestCatalogIsSchemaV1_EmptyIsWritable(t *testing.T) {
+	if !catalogIsSchemaV1(nil) {
+		t.Fatal("empty catalog must be writable schema v1")
+	}
+	if !catalogIsSchemaV1([]stackStateSource{}) {
+		t.Fatal("no sources must be writable schema v1")
+	}
+}
+
 func TestReconcileDuplicateIdenticalIsNotConflict(t *testing.T) {
 	repo := reconcileSources([]stackStateSource{
 		src(t, "a/gh-stack", linearStack),

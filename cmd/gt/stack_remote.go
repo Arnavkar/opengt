@@ -20,12 +20,9 @@ import (
 // upstream API renames fields, only the query/decode pairs here change.
 //
 // Idempotency (performance acceptance: "Stack update: zero mutations when
-// order unchanged") is enforced two ways:
-//   - UpdateStack reads the existing order and skips the mutation when it
-//     already equals the desired order.
-//   - syncStackOrder is the orchestration callers use: it reads, compares
-//     via the pure stackUpdateNeeded helper, and only invokes UpdateStack
-//     when the order differs, returning whether a mutation was made.
+// order unchanged") lives in syncStackOrder: it compares via
+// stackUpdateNeeded and only invokes UpdateStack when the order differs.
+// A snapshot already in hand skips GetStack. UpdateStack is the mutation.
 //
 // The real client performs GraphQL via go-gh's api client (reusing `gh`
 // auth/config, so GHES works). The GraphQL surface is hidden behind the
@@ -159,17 +156,6 @@ func (c *ghStackRemoteClient) UpdateStack(stackID string, prNumbers []int) error
 		return fmt.Errorf("stack remote: update requires a non-empty stack id")
 	}
 
-	existing, err := c.GetStack(stackID)
-	if err != nil {
-		return fmt.Errorf("stack remote: read before update: %w", err)
-	}
-	if existing == nil {
-		return fmt.Errorf("stack remote: stack %q not found", stackID)
-	}
-	if !stackUpdateNeeded(existing.Numbers, prNumbers) {
-		return nil
-	}
-
 	const query = `mutation UpdateStack($id: ID!, $numbers: [Int!]!) {
   updateStack(input: {id: $id, pullRequestNumbers: $numbers}) {
     stack {
@@ -225,9 +211,19 @@ func stackUpdateNeeded(existing, desired []int) bool {
 // concurrent reorder between the read here and the mutation is still safe
 // (the worst case is a redundant read, never a redundant mutation).
 func syncStackOrder(c StackRemoteClient, stackID string, numbers []int) (bool, error) {
-	existing, err := c.GetStack(stackID)
-	if err != nil {
-		return false, err
+	return syncStackOrderKnown(c, stackID, numbers, nil)
+}
+
+// syncStackOrderKnown is syncStackOrder with a snapshot already in hand.
+// A matching known stack skips GetStack.
+func syncStackOrderKnown(c StackRemoteClient, stackID string, numbers []int, known *RemoteStackSnapshot) (bool, error) {
+	existing := known
+	if existing == nil || (existing.ID != "" && stackID != "" && existing.ID != stackID) {
+		var err error
+		existing, err = c.GetStack(stackID)
+		if err != nil {
+			return false, err
+		}
 	}
 	if existing == nil {
 		return false, nil

@@ -83,7 +83,11 @@ func writeStackFile(path string, st *stackState) error {
 		return err
 	}
 	defer unlock()
-	return writeFileAtomic(path, append(out, '\n'))
+	if err := writeFileAtomic(path, append(out, '\n')); err != nil {
+		return err
+	}
+	invalidateCatalogCache()
+	return nil
 }
 
 // writeFileAtomic writes data to path via a temp file in the same directory
@@ -197,6 +201,20 @@ func errForked(branch string) error {
 	return fmt.Errorf(
 		"branch %q belongs to more than one stack; gt only supports linear stacks.\n"+
 			"    Run `gt doctor` to see the definitions, or use gh stack directly.", branch)
+}
+
+func pausedGitRebase() bool {
+	for _, name := range []string{"rebase-merge", "rebase-apply"} {
+		p, err := capture("git", "rev-parse", "--git-path", name)
+		if err != nil || p == "" {
+			continue
+		}
+		info, err := os.Stat(p)
+		if err == nil && info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // pausedOperation reports which gh stack operation, if any, is halted waiting

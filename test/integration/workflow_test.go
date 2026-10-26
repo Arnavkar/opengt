@@ -19,8 +19,11 @@ func TestCreateStartsAndExtendsStack(t *testing.T) {
 
 	f.write("layer-one.txt", "one\n")
 	first := f.gt("create", "layer-one", "-a", "-m", "Add layer one")
-	if !first.announced("gh stack init --base main layer-one") {
-		t.Errorf("create off the trunk did not run `gh stack init --base main layer-one`\n%s", first.output())
+	if !first.announced("git checkout -b layer-one") {
+		t.Errorf("create off the trunk did not run `git checkout -b layer-one`\n%s", first.output())
+	}
+	if first.announced("gh stack init") {
+		t.Errorf("create off the trunk still ran gh stack init\n%s", first.output())
 	}
 	if !first.announced("git commit -m 'Add layer one'") {
 		t.Errorf("create did not make the commit itself\n%s", first.output())
@@ -28,8 +31,11 @@ func TestCreateStartsAndExtendsStack(t *testing.T) {
 
 	f.write("layer-two.txt", "two\n")
 	second := f.gt("create", "layer-two", "-a", "-m", "Add layer two")
-	if !second.announced("gh stack add layer-two") {
-		t.Errorf("create on top of a stack did not run `gh stack add layer-two`\n%s", second.output())
+	if !second.announced("git checkout -b layer-two") {
+		t.Errorf("create on top of a stack did not run `git checkout -b layer-two`\n%s", second.output())
+	}
+	if second.announced("gh stack add") {
+		t.Errorf("create on top of a stack still ran gh stack add\n%s", second.output())
 	}
 
 	if got := f.branch(); got != "layer-two" {
@@ -57,6 +63,27 @@ func TestCreateStartsAndExtendsStack(t *testing.T) {
 	}
 	if got := f.git("status", "--porcelain"); got != "" {
 		t.Errorf("work tree is not clean after create:\n%s", got)
+	}
+
+	// gh-stack 0.2.1 must read a catalog gt wrote without id/number.
+	view := f.run("gh", "stack", "view")
+	if view.code != 0 {
+		t.Errorf("gh stack view rejected the gt-written catalog:\n%s", view.output())
+	}
+	if !strings.Contains(view.stdout, "layer-two") {
+		t.Errorf("gh stack view did not list layer-two:\n%s", view.output())
+	}
+}
+
+func TestCreateNativeDelegatesToGhStack(t *testing.T) {
+	f := newFixture(t)
+	f.write("layer-one.txt", "one\n")
+	r := f.gt("create", "--native", "layer-one", "-a", "-m", "Add layer one")
+	if !r.announced("gh stack init --base main layer-one") {
+		t.Errorf("--native create did not run gh stack init\n%s", r.output())
+	}
+	if got := f.tracked(); len(got) != 1 || got[0] != "layer-one" {
+		t.Errorf("tracked stack is %q, want [layer-one]", got)
 	}
 }
 
@@ -119,8 +146,8 @@ func TestModifyAmendsAndRestacksUpstack(t *testing.T) {
 
 	f.write("layer-one.txt", "one, revised\n")
 	r := f.gt("modify", "-a", "-m", "Add layer one, revised")
-	if !r.announced("gh stack rebase --upstack --no-trunk") {
-		t.Errorf("modify did not cascade the rebase\n%s", r.output())
+	if r.announced("gh stack rebase") {
+		t.Errorf("modify still delegated to gh stack rebase\n%s", r.output())
 	}
 
 	if got := f.commitsIn("main..layer-one"); got != 1 {
@@ -201,8 +228,8 @@ func TestTrackAdoptsCurrentBranch(t *testing.T) {
 	f := newFixture(t)
 	f.git("checkout", "-b", "scratch")
 	r := f.gt("track")
-	if !r.announced("gh stack init --base main scratch") {
-		t.Errorf("gt track did not run gh stack init:\n%s", r.output())
+	if r.announced("gh stack init") {
+		t.Errorf("gt track still ran gh stack init:\n%s", r.output())
 	}
 	if got := f.tracked(); len(got) != 1 || got[0] != "scratch" {
 		t.Errorf("tracked stack is %q, want [scratch]", got)
@@ -229,19 +256,22 @@ func TestNavigation(t *testing.T) {
 	f.layer("layer-three", "Add layer three")
 
 	steps := []struct {
-		command, native, want string
+		command, git, forbidden, want string
 	}{
-		{"down", "gh stack down", "layer-two"},
-		{"d", "gh stack down", "layer-one"},
-		{"u", "gh stack up", "layer-two"},
-		{"t", "gh stack top", "layer-three"},
-		{"b", "gh stack bottom", "layer-one"},
-		{"trunk", "gh stack trunk", "main"},
+		{"down", "git checkout layer-two", "gh stack down", "layer-two"},
+		{"d", "git checkout layer-one", "gh stack down", "layer-one"},
+		{"u", "git checkout layer-two", "gh stack up", "layer-two"},
+		{"t", "git checkout layer-three", "gh stack top", "layer-three"},
+		{"b", "git checkout layer-one", "gh stack bottom", "layer-one"},
+		{"trunk", "git checkout main", "gh stack trunk", "main"},
 	}
 	for _, step := range steps {
 		r := f.gt(step.command)
-		if !r.announced(step.native) {
-			t.Errorf("gt %s did not run `%s`\n%s", step.command, step.native, r.output())
+		if !r.announced(step.git) {
+			t.Errorf("gt %s did not run `%s`\n%s", step.command, step.git, r.output())
+		}
+		if r.announced(step.forbidden) {
+			t.Errorf("gt %s still ran `%s`\n%s", step.command, step.forbidden, r.output())
 		}
 		if got := f.branch(); got != step.want {
 			t.Fatalf("gt %s landed on %q, want %q", step.command, got, step.want)
@@ -313,12 +343,12 @@ func TestLogViews(t *testing.T) {
 	f.layer("layer-two", "Add layer two")
 
 	full := f.gt("log")
-	if !full.announced("gh stack view") {
-		t.Errorf("gt log did not run `gh stack view`\n%s", full.output())
+	if full.announced("gh stack view") {
+		t.Errorf("gt log still ran `gh stack view`\n%s", full.output())
 	}
 	short := f.gt("ls")
-	if !short.announced("gh stack view --short") {
-		t.Errorf("gt ls did not run `gh stack view --short`\n%s", short.output())
+	if short.announced("gh stack view --short") {
+		t.Errorf("gt ls still ran `gh stack view --short`\n%s", short.output())
 	}
 	long := f.gt("ll")
 	if !long.announced("git log --graph --oneline --decorate --all") {
@@ -352,8 +382,8 @@ func TestRestackOntoMovedTrunk(t *testing.T) {
 	f.git("checkout", "--quiet", "layer-two")
 
 	r := f.gt("restack")
-	if !r.announced("gh stack rebase") {
-		t.Errorf("gt restack did not run `gh stack rebase`\n%s", r.output())
+	if r.announced("gh stack rebase") {
+		t.Errorf("gt restack still delegated to `gh stack rebase`\n%s", r.output())
 	}
 	if f.git("rev-parse", "main") != f.git("rev-parse", "layer-one^") {
 		t.Errorf("layer-one was not rebased onto the moved trunk\n%s", f.git("log", "--graph", "--oneline", "--all"))
@@ -370,11 +400,11 @@ func TestRestackDirections(t *testing.T) {
 	f.layer("layer-three", "Add layer three")
 	f.gt("down")
 
-	if r := f.gt("restack", "-d"); !r.announced("gh stack rebase --downstack") {
-		t.Errorf("gt restack -d did not pass --downstack\n%s", r.output())
+	if r := f.gt("restack", "-d"); r.announced("gh stack rebase") {
+		t.Errorf("gt restack -d still delegated to gh stack\n%s", r.output())
 	}
-	if r := f.gt("restack", "-u"); !r.announced("gh stack rebase --upstack") {
-		t.Errorf("gt restack -u did not pass --upstack\n%s", r.output())
+	if r := f.gt("restack", "-u"); r.announced("gh stack rebase") {
+		t.Errorf("gt restack -u still delegated to gh stack\n%s", r.output())
 	}
 	if r := f.gtFails("restack", "-d", "-u"); !strings.Contains(r.stderr, "conflict") {
 		t.Errorf("unexpected error for conflicting directions:\n%s", r.output())
@@ -576,9 +606,8 @@ func TestCheckoutRouting(t *testing.T) {
 }
 
 // pausedRebase builds a stack whose two layers touch the same file, then
-// rewrites the bottom one so the cascading rebase stops on a conflict. gt
-// finds a paused operation by the marker file gh stack leaves behind, so the
-// name of that file is part of the contract.
+// rewrites the bottom one so the cascading rebase stops on a conflict. Native
+// modify leaves git's rebase state; gt continue drives `git rebase`.
 func pausedRebase(t *testing.T) *fixture {
 	t.Helper()
 	f := newFixture(t)
@@ -592,9 +621,8 @@ func pausedRebase(t *testing.T) *fixture {
 	// The rebase is expected to stop, so the exit status is not the point here.
 	f.run(gtBin, "modify", "-a", "-m", "Rewrite layer one")
 
-	if !f.gitFileExists("gh-stack-rebase-state") {
-		t.Fatalf("no .git/gh-stack-rebase-state after a conflicting rebase; gt cannot detect a paused operation\n%s",
-			f.git("status"))
+	if !strings.Contains(f.run("git", "status").stdout+f.run("git", "status").stderr, "rebase") {
+		t.Fatalf("git rebase was not left in progress after a conflicting modify\n%s", f.git("status"))
 	}
 	return f
 }
@@ -602,18 +630,18 @@ func pausedRebase(t *testing.T) *fixture {
 func TestContinueAfterResolvingConflict(t *testing.T) {
 	f := pausedRebase(t)
 
-	if r := f.run(gtBin, "continue"); !r.announced("gh stack rebase --continue") {
+	if r := f.run(gtBin, "continue"); !r.announced("git rebase --continue") {
 		t.Fatalf("gt continue did not resume the rebase\n%s", r.output())
 	}
 
 	f.write("shared.txt", "resolved\n")
 	f.git("add", "shared.txt")
 	r := f.gt("continue")
-	if !r.announced("gh stack rebase --continue") {
+	if !r.announced("git rebase --continue") {
 		t.Errorf("gt continue did not resume the rebase\n%s", r.output())
 	}
-	if f.gitFileExists("gh-stack-rebase-state") {
-		t.Errorf("the paused-rebase marker survived a successful continue")
+	if strings.Contains(f.run("git", "status").stdout, "rebase") {
+		t.Errorf("git rebase was still in progress after continue")
 	}
 	if f.git("rev-parse", "layer-one") != f.git("rev-parse", "layer-two^") {
 		t.Errorf("layer-two was not rebased onto layer-one\n%s", f.git("log", "--graph", "--oneline", "--all"))
@@ -625,11 +653,11 @@ func TestAbortRestoresTheStack(t *testing.T) {
 	before := f.git("rev-parse", "layer-two")
 
 	r := f.gt("abort")
-	if !r.announced("gh stack rebase --abort") {
+	if !r.announced("git rebase --abort") {
 		t.Errorf("gt abort did not abort the rebase\n%s", r.output())
 	}
-	if f.gitFileExists("gh-stack-rebase-state") {
-		t.Errorf("the paused-rebase marker survived the abort")
+	if strings.Contains(f.run("git", "status").stdout, "rebase") {
+		t.Errorf("git rebase was still in progress after abort")
 	}
 	if got := f.git("rev-parse", "layer-two"); got != before {
 		t.Errorf("layer-two is at %s after the abort, want %s", got, before)
@@ -640,7 +668,7 @@ func TestContinueWithNothingPaused(t *testing.T) {
 	f := newFixture(t)
 	f.layer("layer-one", "Add layer one")
 	r := f.gtFails("continue")
-	if !strings.Contains(r.stderr, "no gh stack rebase or modify is in progress") {
+	if !strings.Contains(r.stderr, "no rebase is in progress") {
 		t.Errorf("unexpected error:\n%s", r.output())
 	}
 }

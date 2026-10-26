@@ -253,6 +253,240 @@ func TestRestackResult_SkippedBranchFlags(t *testing.T) {
 	}
 }
 
+func TestCascadeRestack_LoadedFactsDoNotListWorktreesOrMergeBase(t *testing.T) {
+	resetProcessCaches(t)
+	cachedFacts = restackFacts()
+	var worktreeCalls, ancestorCalls, rebaseCalls int
+	results, _, err := cascadeRestack(restackStack(), RestackOpts{Trunk: "main"}, restackGit{
+		current: func() (string, error) { return "c", nil },
+		head: func(name string) (string, error) {
+			return cachedFacts.heads[name], nil
+		},
+		worktree: func(name string) (string, error) {
+			worktreeCalls++
+			t.Fatalf("worktree %s", name)
+			return "", nil
+		},
+		ancestor: func(parent, child string) bool {
+			ancestorCalls++
+			t.Fatalf("ancestor %s %s", parent, child)
+			return false
+		},
+		rebase: func(parent, oldBase, branch string, interactive bool) error {
+			rebaseCalls++
+			t.Fatalf("rebase %s %s", parent, branch)
+			return nil
+		},
+		noteHead: func(branch, sha string) {
+			cachedFacts.heads[branch] = sha
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("got %d results, want 3", len(results))
+	}
+	want := []RestackResult{
+		{Branch: "a", OldSHA: "sha-a", NewSHA: "sha-a"},
+		{Branch: "b", OldSHA: "sha-b", NewSHA: "sha-b"},
+		{Branch: "c", OldSHA: "sha-c", NewSHA: "sha-c"},
+	}
+	for i, r := range results {
+		if r.Branch != want[i].Branch || r.OldSHA != want[i].OldSHA || r.NewSHA != want[i].NewSHA || r.Moved || r.Skipped {
+			t.Fatalf("result %d = %+v, want %+v", i, r, want[i])
+		}
+	}
+	if worktreeCalls != 0 || ancestorCalls != 0 || rebaseCalls != 0 {
+		t.Fatalf("worktree=%d ancestor=%d rebase=%d", worktreeCalls, ancestorCalls, rebaseCalls)
+	}
+}
+
+func TestCascadeRestack_EmptyBaseChecksAncestorOnce(t *testing.T) {
+	resetProcessCaches(t)
+	cachedFacts = restackFacts()
+	stack := restackStack()
+	stack[1].Base = ""
+	var worktreeCalls, ancestorCalls, rebaseCalls int
+	results, _, err := cascadeRestack(stack, RestackOpts{Trunk: "main"}, restackGit{
+		current: func() (string, error) { return "c", nil },
+		head: func(name string) (string, error) {
+			return cachedFacts.heads[name], nil
+		},
+		worktree: func(name string) (string, error) {
+			worktreeCalls++
+			t.Fatalf("worktree %s", name)
+			return "", nil
+		},
+		ancestor: func(parent, child string) bool {
+			ancestorCalls++
+			return true
+		},
+		rebase: func(parent, oldBase, branch string, interactive bool) error {
+			rebaseCalls++
+			t.Fatalf("rebase %s %s", parent, branch)
+			return nil
+		},
+		noteHead: func(branch, sha string) {
+			cachedFacts.heads[branch] = sha
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("got %d results, want 3", len(results))
+	}
+	for _, r := range results {
+		if r.Moved || r.Skipped {
+			t.Fatalf("%s moved=%v skipped=%v", r.Branch, r.Moved, r.Skipped)
+		}
+	}
+	if ancestorCalls != 1 || rebaseCalls != 0 || worktreeCalls != 0 {
+		t.Fatalf("ancestor=%d rebase=%d worktree=%d", ancestorCalls, rebaseCalls, worktreeCalls)
+	}
+}
+
+func TestCascadeRestack_RebaseNotesNewHead(t *testing.T) {
+	resetProcessCaches(t)
+	cachedFacts = restackFacts()
+	stack := restackStack()
+	stack[1].Base = ""
+	var worktreeCalls int
+	var noted string
+	var g restackGit
+	g.current = func() (string, error) { return "c", nil }
+	g.worktree = func(name string) (string, error) {
+		worktreeCalls++
+		t.Fatalf("worktree %s", name)
+		return "", nil
+	}
+	g.ancestor = func(parent, child string) bool {
+		return child != "b"
+	}
+	g.noteHead = func(branch, sha string) {
+		cachedFacts.heads[branch] = sha
+		if branch == "b" {
+			noted = sha
+		}
+	}
+	g.rebase = func(parent, oldBase, branch string, interactive bool) error {
+		if branch == "b" {
+			g.noteHead(branch, "sha-b2")
+		}
+		return nil
+	}
+	g.head = func(name string) (string, error) {
+		if name == "b" && noted != "" {
+			return noted, nil
+		}
+		sha, ok := cachedFacts.heads[name]
+		if name == "b" && noted == "" {
+			sha = "sha-b"
+			ok = true
+		}
+		if !ok {
+			t.Fatalf("head %s", name)
+		}
+		return sha, nil
+	}
+	results, _, err := cascadeRestack(stack, RestackOpts{Trunk: "main"}, g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worktreeCalls != 0 {
+		t.Fatalf("worktree calls = %d", worktreeCalls)
+	}
+	var sawB bool
+	for _, r := range results {
+		if r.Branch != "b" {
+			if r.Moved || r.Skipped {
+				t.Fatalf("%s = %+v, want unmoved", r.Branch, r)
+			}
+			continue
+		}
+		sawB = true
+		if !r.Moved || r.NewSHA != "sha-b2" || r.Skipped {
+			t.Fatalf("b = %+v, want moved to sha-b2", r)
+		}
+	}
+	if !sawB {
+		t.Fatal("missing result for b")
+	}
+	if cachedFacts.heads["b"] != "sha-b2" {
+		t.Fatalf("facts head b = %q, want sha-b2", cachedFacts.heads["b"])
+	}
+}
+
+func TestRestoreFactsAfterRebase_CurrentFollowsRebasedBranch(t *testing.T) {
+	resetProcessCaches(t)
+	saved := GitFacts{
+		heads:     map[string]string{"a": "old", "b": "sha-b"},
+		worktrees: map[string]string{},
+		current:   "b",
+		ready:     true,
+	}
+	restoreFactsAfterRebase(saved, "a", "new")
+	if cachedFacts.current != "a" {
+		t.Fatalf("current = %q, want a", cachedFacts.current)
+	}
+	if cachedFacts.heads["a"] != "new" || cachedFacts.heads["b"] != "sha-b" {
+		t.Fatalf("heads = %#v, want a=new b=sha-b", cachedFacts.heads)
+	}
+}
+
+func restackFacts() GitFacts {
+	return GitFacts{
+		heads: map[string]string{
+			"main": "sha-main",
+			"a":    "sha-a",
+			"b":    "sha-b",
+			"c":    "sha-c",
+		},
+		worktrees: map[string]string{},
+		current:   "c",
+		ready:     true,
+	}
+}
+
+func TestRestackScope(t *testing.T) {
+	stack := trackedStack{
+		Trunk:    trackedBranch{Branch: "main"},
+		Branches: restackStack(),
+	}
+	full, trunk, err := restackScope(stack, "b", false, false)
+	if err != nil || trunk != "main" || len(full) != 3 || full[0].Branch != "a" {
+		t.Fatalf("full = %v trunk=%s err=%v", namesOf(full), trunk, err)
+	}
+	down, trunk, err := restackScope(stack, "b", true, false)
+	if err != nil || trunk != "main" || len(down) != 2 || down[1].Branch != "b" {
+		t.Fatalf("down = %v trunk=%s err=%v", namesOf(down), trunk, err)
+	}
+	up, trunk, err := restackScope(stack, "b", false, true)
+	if err != nil || trunk != "a" || len(up) != 2 || up[0].Branch != "b" || up[1].Branch != "c" {
+		t.Fatalf("up = %v trunk=%s err=%v", namesOf(up), trunk, err)
+	}
+	if _, _, err := restackScope(stack, "missing", true, false); err == nil {
+		t.Fatal("missing branch should error")
+	}
+}
+
+func namesOf(stack []trackedBranch) []string {
+	out := make([]string, len(stack))
+	for i, b := range stack {
+		out[i] = b.Branch
+	}
+	return out
+}
+
+func restackStack() []trackedBranch {
+	return []trackedBranch{
+		{Branch: "a", Base: "sha-main"},
+		{Branch: "b", Base: "sha-a"},
+		{Branch: "c", Base: "sha-b"},
+	}
+}
+
 func TestRestackResult_MovedWhenSHAChanged(t *testing.T) {
 	res := RestackResult{Branch: "a", OldSHA: "old", NewSHA: "new"}
 	res.Moved = res.OldSHA != res.NewSHA

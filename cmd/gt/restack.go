@@ -82,14 +82,123 @@ func stackParents(stack []trackedBranch, trunk string) map[string]string {
 	return parents
 }
 
+// restackScope is the slice CascadeRestack should run. down includes this
+// branch and its ancestors (onto the trunk). up includes this branch and
+// its descendants; the parent of the current branch is passed as trunk so
+// the bottom of that slice still sits on the live parent, not a cached SHA.
+func restackScope(stack trackedStack, current string, down, up bool) ([]trackedBranch, string, error) {
+	if !down && !up {
+		return stack.Branches, stack.Trunk.Branch, nil
+	}
+	idx := -1
+	for i, b := range stack.Branches {
+		if b.Branch == current {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return nil, "", fmt.Errorf("branch %q is not a member of this stack", current)
+	}
+	if down && up {
+		return nil, "", fmt.Errorf("--downstack and --upstack conflict")
+	}
+	if down {
+		return stack.Branches[:idx+1], stack.Trunk.Branch, nil
+	}
+	trunk := stack.Trunk.Branch
+	if idx > 0 {
+		trunk = stack.Branches[idx-1].Branch
+	}
+	return stack.Branches[idx:], trunk, nil
+}
+
+// restackGit is the git seam CascadeRestack uses. Tests pass a fake.
+// Production funcs read GitFacts and run git rebase.
+type restackGit struct {
+	current  func() (string, error)
+	head     func(name string) (string, error)
+	worktree func(name string) (string, error)
+	ancestor func(parent, child string) bool
+	rebase   func(parent, oldBase, branch string, interactive bool) error
+	noteHead func(branch, sha string)
+}
+
+func realRestackGit() restackGit {
+	return restackGit{
+		current:  currentBranch,
+		head:     branchHead,
+		worktree: worktreePathForBranch,
+		ancestor: isAncestor,
+		rebase:   gitRebaseBranch,
+		noteHead: noteHead,
+	}
+}
+
+// gitRebaseBranch drops the snapshot before git moves refs, so a failed
+// rebase is not observed as the old tips. On success the pre-rebase snapshot
+// is put back and only this branch's SHA is replaced. That keeps the cascade
+// from running for-each-ref once per branch.
+func gitRebaseBranch(parent, oldBase, branch string, interactive bool) error {
+	saved := cachedFacts
+	invalidateGitFacts()
+	args := []string{"rebase"}
+	if interactive {
+		args = append(args, "--interactive")
+	}
+	if oldBase != "" {
+		args = append(args, "--onto", parent, oldBase, branch)
+	} else {
+		args = append(args, parent, branch)
+	}
+	if err := run("git", args...); err != nil {
+		return err
+	}
+	sha, err := capture("git", "rev-parse", "--verify", "--quiet", branch)
+	if err != nil {
+		return err
+	}
+	restoreFactsAfterRebase(saved, branch, sha)
+	return nil
+}
+
+// restoreFactsAfterRebase puts the pre-rebase snapshot back, then records the
+// one ref git just moved. git rebase <parent> <branch> leaves HEAD on branch,
+// so the cached current branch has to follow or the next stack in this
+// process treats that checkout as a foreign worktree.
+func restoreFactsAfterRebase(saved GitFacts, branch, sha string) {
+	cachedFacts = saved
+	if !cachedFacts.ready {
+		return
+	}
+	noteHead(branch, sha)
+	cachedFacts.current = branch
+}
+
 // CascadeRestack rebases each branch onto its parent in stack order, returning
 // one RestackResult per branch and a Rollback usable to recover local refs on
 // conflict. Zero GitHub API calls happen here. Branches checked out in other
 // worktrees are skipped.
 func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *Rollback, error) {
-	head, err := currentBranch()
-	if err != nil {
-		return nil, nil, err
+	return cascadeRestack(stack, opts, realRestackGit())
+}
+
+func cascadeRestack(stack []trackedBranch, opts RestackOpts, g restackGit) ([]RestackResult, *Rollback, error) {
+	if !cachedFacts.ready {
+		_, _ = gitFacts()
+	}
+
+	var head string
+	var err error
+	if cachedFacts.ready && cachedFacts.current != "" {
+		head = cachedFacts.current
+	} else if g.current != nil {
+		head, err = g.current()
+		if err != nil {
+			return nil, nil, err
+		}
+	} else {
+		return nil, nil, fmt.Errorf("HEAD is detached; check out a branch first")
 	}
 
 	rb := &Rollback{
@@ -98,28 +207,38 @@ func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *
 	}
 	heads := make(map[string]string, len(stack))
 	for _, b := range stack {
-		sha, err := branchHead(b.Branch)
-		if err != nil {
-			return nil, nil, err
+		sha, herr := restackHead(g, b.Branch)
+		if herr != nil {
+			return nil, nil, herr
 		}
 		rb.OriginalRefs[b.Branch] = sha
 		heads[b.Branch] = sha
 	}
 
 	parents := stackParents(stack, opts.Trunk)
-
-	ancestor := make(map[string]bool, len(stack))
 	worktree := make(map[string]string, len(stack))
-	for _, b := range stack {
-		ancestor[b.Branch] = isAncestor(parents[b.Branch], b.Branch)
-		wt, err := worktreePathForBranch(b.Branch)
-		if err != nil {
-			return nil, nil, err
+	if cachedFacts.ready {
+		for _, b := range stack {
+			worktree[b.Branch] = cachedFacts.worktrees[b.Branch]
 		}
-		worktree[b.Branch] = wt
+	} else {
+		for _, b := range stack {
+			wt, werr := g.worktree(b.Branch)
+			if werr != nil {
+				return nil, nil, werr
+			}
+			worktree[b.Branch] = wt
+		}
 	}
 
-	actions := planRestack(stack, heads, parents, ancestor, worktree, head, opts)
+	// The setup ancestry pass is dead. planRestack still applies worktree
+	// and merged skips. The execute loop decides whether to rebase.
+	actions := planRestack(stack, heads, parents, map[string]bool{}, worktree, head, opts)
+
+	bases := make(map[string]string, len(stack))
+	for _, b := range stack {
+		bases[b.Branch] = b.Base
+	}
 
 	results := make([]RestackResult, 0, len(stack))
 	for _, act := range actions {
@@ -132,14 +251,18 @@ func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *
 			continue
 		}
 
-		// planRestack decided from ancestry captured before any branch moved.
-		// An ancestor rebased earlier in this cascade invalidates that
-		// decision (the parent's old SHA was an ancestor; its new head is
-		// not), so the live refs are authoritative unless Force says
-		// rebase regardless.
+		// Catalog Base is the parent SHA from the last write. When it still
+		// equals the parent's live tip, merge-base would only confirm that.
+		// A raw-SHA parent misses facts.heads, and a parent noteHead just
+		// moved disagrees with the child's cached Base, so those ask
+		// merge-base once. Force rebases without asking.
 		rebase := act.Rebase
 		if !opts.Force {
-			rebase = !isAncestor(act.Parent, act.Branch)
+			if catalogBaseMatches(bases[act.Branch], act.Parent) {
+				rebase = false
+			} else {
+				rebase = !g.ancestor(act.Parent, act.Branch)
+			}
 		}
 
 		if !rebase {
@@ -148,12 +271,12 @@ func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *
 			continue
 		}
 
-		args := []string{"rebase"}
-		if opts.Interactive {
-			args = append(args, "--interactive")
-		}
-		args = append(args, act.Parent, act.Branch)
-		if err := run("git", args...); err != nil {
+		if err := g.rebase(act.Parent, bases[act.Branch], act.Branch, opts.Interactive); err != nil {
+			if opts.PauseOnConflict {
+				return results, rb, fmt.Errorf("rebase %s onto %s failed: %w\n"+
+					"    resolve the conflict, then `gt continue` (or `gt abort`)",
+					act.Branch, act.Parent, err)
+			}
 			if rbErr := applyRollback(*rb); rbErr != nil {
 				return results, rb, fmt.Errorf("rebase %s onto %s failed: %w (rollback also failed: %v)",
 					act.Branch, act.Parent, err, rbErr)
@@ -164,9 +287,12 @@ func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *
 				act.Branch, act.Parent, err, act.Parent, act.Branch)
 		}
 
-		newSHA, err := branchHead(act.Branch)
+		newSHA, err := g.head(act.Branch)
 		if err != nil {
 			return results, rb, err
+		}
+		if g.noteHead != nil {
+			g.noteHead(act.Branch, newSHA)
 		}
 		res.NewSHA = newSHA
 		res.Moved = res.OldSHA != res.NewSHA
@@ -174,6 +300,26 @@ func CascadeRestack(stack []trackedBranch, opts RestackOpts) ([]RestackResult, *
 	}
 
 	return results, rb, nil
+}
+
+func restackHead(g restackGit, name string) (string, error) {
+	if cachedFacts.ready {
+		if sha, ok := cachedFacts.heads[name]; ok {
+			return sha, nil
+		}
+	}
+	if g.head == nil {
+		return "", fmt.Errorf("missing head for %s", name)
+	}
+	return g.head(name)
+}
+
+func catalogBaseMatches(base, parent string) bool {
+	if base == "" || !cachedFacts.ready {
+		return false
+	}
+	live, ok := cachedFacts.heads[parent]
+	return ok && live == base
 }
 
 // rebaseDescendantsOnto drops oldBaseSHA from each descendant by rebasing
@@ -197,6 +343,7 @@ func rebaseDescendantsOnto(descendants []trackedBranch, onto, oldBaseSHA string)
 	}
 	prevOld, prevNew := oldBaseSHA, onto
 	for _, b := range descendants {
+		invalidateGitFacts()
 		if err := run("git", "rebase", "--onto", prevNew, prevOld, b.Branch); err != nil {
 			if rbErr := applyRollback(rb); rbErr != nil {
 				return fmt.Errorf("rebase %s onto %s failed: %w (rollback also failed: %v)",
@@ -215,8 +362,10 @@ func rebaseDescendantsOnto(descendants []trackedBranch, onto, oldBaseSHA string)
 
 // applyRollback restores local refs captured before a restack. It aborts any
 // in-progress rebase, resets each tracked branch to its original SHA, and
-// restores HEAD. It performs no remote mutations.
+// restores HEAD. It performs no remote mutations. Many refs move, so the
+// process-local git snapshot is dropped.
 func applyRollback(rb Rollback) error {
+	invalidateGitFacts()
 	_ = run2("git", "rebase", "--abort")
 
 	for branch, sha := range rb.OriginalRefs {

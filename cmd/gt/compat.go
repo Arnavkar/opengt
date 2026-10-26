@@ -15,8 +15,10 @@ import (
 var ghStackCompat = GhStackCompatibility{
 	// 0.2.0 is the floor: it introduced the single shared catalog gt reads,
 	// so older per-worktree tracking predates gt's whole state model.
+	// 0.2.1 is the latest release (go-gh 2.16.2 SSH-host fix, api_host).
+	// Schema stays v1; CLI flags and the catalog path did not change.
 	MinVersion:     Version{0, 2, 0},
-	TestedVersion:  Version{0, 2, 0},
+	TestedVersion:  Version{0, 2, 1},
 	SchemaVersions: []int{1},
 	StateFileName:  "gh-stack",
 }
@@ -125,11 +127,16 @@ func requireGhStack() error {
 		return ghStackErr
 	}
 	ghStackChecked = true
-	if _, err := ensureExtension(); err != nil {
-		ghStackErr = err
-		return err
-	}
 	st, err := inspectGhStack()
+	if err != nil && !st.Installed {
+		// That capture already showed the extension is missing. Install
+		// without a second version probe, then read the version once.
+		if _, ierr := installGhStack(); ierr != nil {
+			ghStackErr = ierr
+			return ghStackErr
+		}
+		st, err = inspectGhStack()
+	}
 	if err != nil {
 		ghStackErr = err
 		return err

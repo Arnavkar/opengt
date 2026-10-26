@@ -44,6 +44,10 @@ const prSelectionSet = "{\n" +
 // The resolved owner/name is stored in c.repo as "OWNER/REPO"; the host is
 // not stored because api.DefaultGraphQLClient resolves the correct GraphQL
 // endpoint from gh's config on its own.
+//
+// go-gh v2.16.2+ expands SSH host aliases (github.com-work → github.com)
+// before matching remotes, matching gh-stack 0.2.1. Earlier go-gh versions
+// filtered on the pre-expansion host and failed NewGitHubClient on those remotes.
 func NewGitHubClient() (*GitHubClient, error) {
 	repo, err := repository.Current()
 	if err != nil {

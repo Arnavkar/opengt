@@ -326,6 +326,23 @@ func TestSyncStackOrder_AbsentStackNoMutation(t *testing.T) {
 	}
 }
 
+func TestSyncStackOrderKnown_SkipsGetStack(t *testing.T) {
+	fake := newFakeStackClient(map[string][]int{
+		"S1": {101, 102, 103},
+	})
+	known := &RemoteStackSnapshot{ID: "S1", Numbers: []int{101, 102, 103}}
+	mutated, err := syncStackOrderKnown(fake, "S1", []int{101, 102, 103}, known)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutated {
+		t.Fatal("mutated")
+	}
+	if fake.getCalls != 0 {
+		t.Fatalf("GetStack called %d times, want 0", fake.getCalls)
+	}
+}
+
 func TestSyncStackOrder_PropagatesGetStackError(t *testing.T) {
 	fake := newFakeStackClient(map[string][]int{"S1": {1}})
 	fake.getErr = errFake("simulated network failure")

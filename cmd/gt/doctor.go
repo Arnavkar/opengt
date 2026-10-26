@@ -282,19 +282,11 @@ func countUntrackedWithHeads(repo repoStackState, localHeads map[string]string) 
 }
 
 func localBranchHeads() (map[string]string, error) {
-	out, err := capture("git", "for-each-ref",
-		"--format=%(refname:short)%09%(objectname)", "refs/heads")
+	facts, err := gitFacts()
 	if err != nil {
 		return nil, err
 	}
-	heads := map[string]string{}
-	for _, line := range strings.Split(out, "\n") {
-		name, head, ok := strings.Cut(line, "\t")
-		if ok && name != "" {
-			heads[name] = head
-		}
-	}
-	return heads, nil
+	return facts.heads, nil
 }
 
 func worktreeRows(sources []stackStateSource) []map[string]any {

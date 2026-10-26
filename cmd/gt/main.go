@@ -26,32 +26,32 @@ type command struct {
 }
 
 var commands = []command{
-	{[]string{"create", "c"}, "gh stack init | gh stack add", cmdCreate},
-	{[]string{"modify", "m"}, "git commit + gh stack rebase --upstack --no-trunk", cmdModify},
+	{[]string{"create", "c"}, "git checkout -b + catalog", cmdCreate},
+	{[]string{"modify", "m"}, "git commit + rebase upstack", cmdModify},
 	{[]string{"submit", "s"}, "push through current (asks before upstack)", cmdSubmit},
 	{[]string{"ss"}, "atomic push + PR update (whole stack)", func(a []string) error {
 		return cmdSubmit(append([]string{"--stack"}, a...))
 	}},
 	{[]string{"sync"}, "fetch + restack (no push)", cmdSync},
 	{[]string{"doctor"}, "diagnose local stacks vs Git and GitHub", cmdDoctor},
-	{[]string{"restack"}, "gh stack rebase", cmdRestack},
-	{[]string{"continue"}, "gh stack rebase|modify --continue", cmdContinue},
-	{[]string{"abort"}, "gh stack rebase|modify --abort", cmdAbort},
+	{[]string{"restack"}, "git rebase cascade", cmdRestack},
+	{[]string{"continue"}, "git rebase --continue", cmdContinue},
+	{[]string{"abort"}, "git rebase --abort", cmdAbort},
 	{[]string{"checkout", "co"}, "tree picker | gh stack checkout", cmdCheckout},
 	{[]string{"delete"}, "tree picker + restack", cmdDelete},
 	{[]string{"get"}, "gh stack checkout", cmdGet},
-	{[]string{"log"}, "gh stack view", cmdLog},
-	{[]string{"ls"}, "gh stack view --short", func(a []string) error {
+	{[]string{"log"}, "show the current stack", cmdLog},
+	{[]string{"ls"}, "show the current stack, short", func(a []string) error {
 		return cmdLog(append([]string{"short"}, a...))
 	}},
 	{[]string{"ll"}, "git log --graph", func(a []string) error {
 		return cmdLog(append([]string{"long"}, a...))
 	}},
-	{[]string{"up", "u"}, "gh stack up", passthrough("up")},
-	{[]string{"down", "d"}, "gh stack down", passthrough("down")},
-	{[]string{"top", "t"}, "gh stack top", passthrough("top")},
-	{[]string{"bottom", "b"}, "gh stack bottom", passthrough("bottom")},
-	{[]string{"trunk"}, "gh stack trunk", passthrough("trunk")},
+	{[]string{"up", "u"}, "check out the branch above", cmdUp},
+	{[]string{"down", "d"}, "check out the branch below", cmdDown},
+	{[]string{"top", "t"}, "check out the tip", cmdTop},
+	{[]string{"bottom", "b"}, "check out the bottom branch", cmdBottom},
+	{[]string{"trunk"}, "check out the stack trunk", cmdTrunk},
 	{[]string{"merge"}, "gh stack merge", passthrough("merge")},
 	{[]string{"switch"}, "gh stack switch", passthrough("switch")},
 	{[]string{"pr"}, "gh pr view --web", cmdPR},
@@ -60,7 +60,7 @@ var commands = []command{
 	{[]string{"rebase"}, "git rebase", gitPass("rebase")},
 	{[]string{"reset"}, "git reset", gitPass("reset")},
 	{[]string{"restore"}, "git restore", gitPass("restore")},
-	{[]string{"track", "tr"}, "gh stack init", cmdTrack},
+	{[]string{"track", "tr"}, "adopt branches into catalog", cmdTrack},
 	{[]string{"init"}, "(explains the gh stack model)", cmdInit},
 }
 

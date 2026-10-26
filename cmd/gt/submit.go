@@ -9,7 +9,7 @@ import (
 // (including the native stack), plan, then mutate. --native stays available
 // only before any mutation.
 func executeSubmit(opts SubmitOpts, native, edit, publish bool, extra []string) error {
-	repo, err := loadRepoStacks()
+	repo, err := loadNativeRepo()
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func executeSubmit(opts SubmitOpts, native, edit, publish bool, extra []string) 
 		if cerr != nil {
 			fmt.Fprintf(os.Stderr, "gt: warning: stack remote: %v\n", cerr)
 		} else {
-			changed, serr := syncStackOrder(client, plan.StackUpdate.StackID, plan.StackUpdate.Numbers)
+			changed, serr := syncStackOrderKnown(client, plan.StackUpdate.StackID, plan.StackUpdate.Numbers, snap.RemoteStack)
 			if serr != nil {
 				fmt.Fprintf(os.Stderr, "gt: warning: stack update: %v\n", serr)
 			} else if changed {

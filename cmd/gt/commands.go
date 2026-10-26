@@ -25,10 +25,10 @@ func parse(fs *pflag.FlagSet, args []string) error {
 	return err
 }
 
-// cmdCreate branches off the current position. On the top branch of a stack
-// that is `gh stack add`; off a branch in no stack (the trunk, usually) it is
-// `gh stack init`, which starts a second stack rather than appending to the
-// first. From the middle of a stack it refuses: that would be a fork.
+// cmdCreate branches off the current position. At the top of a stack it
+// appends a layer; off a branch in no stack (the trunk, usually) it starts a
+// new one. From the middle of a stack it refuses: that would be a fork.
+// --native keeps today's `gh stack add` / `gh stack init`.
 func cmdCreate(args []string) error {
 	fs := newFlags("create [name]")
 	all := fs.BoolP("all", "a", false, "stage all changes, including untracked files")
@@ -36,6 +36,7 @@ func cmdCreate(args []string) error {
 	patch := fs.BoolP("patch", "p", false, "pick hunks to stage before committing")
 	insert := fs.BoolP("insert", "i", false, "insert between the current branch and its child")
 	msg := fs.StringArrayP("message", "m", nil, "commit message")
+	native := fs.Bool("native", false, "delegate branch creation to gh stack")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -47,7 +48,7 @@ func cmdCreate(args []string) error {
 	if err != nil {
 		return err
 	}
-	pos, _, err := requireStackPosition(branch)
+	pos, repo, err := requireNativePosition(branch)
 	if err != nil {
 		return err
 	}
@@ -79,18 +80,49 @@ func cmdCreate(args []string) error {
 		return err
 	}
 
-	// gh stack only creates and checks out the branch here. Its own -A/-u/-m
-	// staging is deliberately unused: on a parent that carries no commits yet
-	// it puts the commit on the parent instead of creating the new branch.
+	if *native {
+		return createViaGhStack(pos, branch, name, message)
+	}
+	return createNative(repo, pos, branch, name, message)
+}
+
+func createViaGhStack(pos position, parent, name, message string) error {
+	var err error
 	if pos.inStack {
 		err = run("gh", "stack", "add", name)
 	} else {
-		err = run("gh", "stack", "init", "--base", branch, name)
+		err = run("gh", "stack", "init", "--base", parent, name)
 	}
 	if err != nil {
 		return err
 	}
+	invalidateGitFacts()
+	return commitIfStaged(message)
+}
 
+func createNative(repo *repoStackState, pos position, parent, name, message string) error {
+	if err := run("git", "checkout", "-b", name); err != nil {
+		return err
+	}
+	invalidateGitFacts()
+	if err := applyCreateToRepo(repo, parent, name, pos.inStack); err != nil {
+		return err
+	}
+	if err := persistCreatedStack(repo); err != nil {
+		return err
+	}
+	if err := commitIfStaged(message); err != nil {
+		return err
+	}
+	return persistCreatedStack(repo)
+}
+
+func persistCreatedStack(repo *repoStackState) error {
+	refreshStackSHAs(repo)
+	return persistSyncState(repo)
+}
+
+func commitIfStaged(message string) error {
 	if !hasStagedChanges() {
 		return nil
 	}
@@ -98,12 +130,15 @@ func cmdCreate(args []string) error {
 	if message != "" {
 		commit = append(commit, "-m", message)
 	}
-	return run("git", commit...)
+	if err := run("git", commit...); err != nil {
+		return err
+	}
+	invalidateGitFacts()
+	return nil
 }
 
 // cmdModify amends (or adds to) the current branch and restacks everything
-// above it. gh stack has no equivalent command, so gt drives git directly and
-// then asks gh stack to cascade the rebase.
+// above it. gh stack has no equivalent command, so gt drives git directly.
 func cmdModify(args []string) error {
 	fs := newFlags("modify")
 	commitNew := fs.BoolP("commit", "c", false, "create a new commit instead of amending")
@@ -112,6 +147,7 @@ func cmdModify(args []string) error {
 	patch := fs.BoolP("patch", "p", false, "pick hunks to stage before committing")
 	edit := fs.BoolP("edit", "e", false, "open an editor for the commit message")
 	msg := fs.StringArrayP("message", "m", nil, "commit message")
+	native := fs.Bool("native", false, "delegate the upstack rebase to gh stack")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -120,9 +156,16 @@ func cmdModify(args []string) error {
 	if err != nil {
 		return err
 	}
-	pos, _, err := requireStackPosition(branch)
+	repo, err := loadNativeRepo()
 	if err != nil {
 		return err
+	}
+	if hits := repo.ambiguous(branch); len(hits) > 0 {
+		return errAmbiguous(branch, hits)
+	}
+	pos := locate(repo.asState(), branch)
+	if pos.forked {
+		return errForked(branch)
 	}
 	if !pos.inStack {
 		return errNotInStack(branch)
@@ -158,11 +201,15 @@ func cmdModify(args []string) error {
 	if err := run("git", commit...); err != nil {
 		return err
 	}
+	invalidateGitFacts()
 
 	if pos.atTop {
 		return nil
 	}
-	return run("gh", "stack", "rebase", "--upstack", "--no-trunk")
+	if *native {
+		return run("gh", "stack", "rebase", "--upstack", "--no-trunk")
+	}
+	return restackCurrentStack(repo, branch, false, true)
 }
 
 func errNotInStack(branch string) error {
@@ -519,7 +566,7 @@ func cmdSync(args []string) error {
 	}
 
 	// Sync is repo-wide (decision #9): every stack, not just HEAD's.
-	repo, err := loadRepoStacks()
+	repo, err := loadNativeRepo()
 	if err != nil {
 		return err
 	}
@@ -537,17 +584,17 @@ func cmdSync(args []string) error {
 		fmt.Fprintf(os.Stderr, "gt: could not load pull requests (%v); proceeding with refs only\n", snapErr)
 	}
 
-	groups, err := listTrackedStackGroups()
+	groups, err := listTrackedStackGroupsFrom(repo.asState())
 	if err != nil {
 		return err
 	}
-	plan := BuildSyncPlan(repo, snap, groups, trunkNames())
+	plan := BuildSyncPlan(repo, snap, groups, trunkNamesFrom(repo))
 
 	// executeSyncPlan runs the whole sync flow in order: fast-forward the
 	// trunk and behind branches, delete a stack only when every PR in it is
 	// merged or closed, cascade-restack every
 	// stack against the updated trunk, and persist the refreshed state.
-	_, err = executeSyncPlan(plan, snap, groups, *noRestack, *force, *deleteAll)
+	_, err = executeSyncPlan(repo, plan, snap, groups, *noRestack, *force, *deleteAll)
 	return err
 }
 
@@ -574,7 +621,7 @@ func collectSyncBranches(repo *repoStackState) []string {
 	// Always load the trunk even when no stack is tracked, so a bare-trunk
 	// sync can still see whether origin/main is ahead (the plan derives the
 	// trunk from repo stacks, which is empty here).
-	add(fallbackTrunk(trunkNames()))
+	add(fallbackTrunk(trunkNamesFrom(repo)))
 	for _, s := range repo.Stacks {
 		add(s.Trunk.Branch)
 		for _, b := range s.Branches {
@@ -605,8 +652,8 @@ func buildKnownPRs(repo *repoStackState) map[string]int {
 // and cascade restacks. It returns moved=true when any local ref changed, so
 // the caller can persist stack state once. No remote mutations happen here;
 // a restack conflict aborts with the error before any push.
-func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, groups [][]localBranch, noRestack bool, force bool, deleteAll bool) (bool, error) {
-	moved, err := fastForwardSyncBranches(plan, snap)
+func executeSyncPlan(repo *repoStackState, plan SyncPlan, snap *RemoteSnapshot, groups [][]localBranch, noRestack bool, force bool, deleteAll bool) (bool, error) {
+	moved, err := fastForwardSyncBranches(repo, plan, snap)
 	if err != nil {
 		return moved, err
 	}
@@ -619,14 +666,21 @@ func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, groups [][]localBranch
 		return moved, err
 	}
 
+	// dropBranchesFromStackFiles rewrites the catalog and does not update the
+	// in-memory repo. Reload once so restack and the later SHA refresh do not
+	// put the deleted stack back. The clean path keeps the repo it was given.
+	if pruned {
+		reloaded, rerr := loadNativeRepo()
+		if rerr != nil {
+			return moved, rerr
+		}
+		repo = reloaded
+	}
+
 	// A finished stack is removed whole. A stack that still has open work keeps
 	// its merged branches, so the restack runs against that full chain.
 	var restacked bool
 	if !noRestack {
-		repo, err := loadRepoStacks()
-		if err != nil {
-			return moved, err
-		}
 		restacked, err = restackSyncStacks(repo, snap, force)
 		if err != nil {
 			return moved, err
@@ -634,10 +688,6 @@ func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, groups [][]localBranch
 	}
 
 	if moved || restacked || pruned {
-		repo, err := loadRepoStacks()
-		if err != nil {
-			return moved, err
-		}
 		refreshStackSHAs(repo)
 		if err := persistSyncState(repo); err != nil {
 			return moved, err
@@ -649,14 +699,14 @@ func executeSyncPlan(plan SyncPlan, snap *RemoteSnapshot, groups [][]localBranch
 // fastForwardSyncBranches fetches when anything is behind, then fast-forwards
 // the trunk and any stack branches strictly behind their remote. It returns
 // moved=true when a local ref changed.
-func fastForwardSyncBranches(plan SyncPlan, snap *RemoteSnapshot) (bool, error) {
+func fastForwardSyncBranches(repo *repoStackState, plan SyncPlan, snap *RemoteSnapshot) (bool, error) {
 	// The plan derives the trunk from repo stacks; when none is tracked it
 	// cannot, so resolve the effective trunk here (executor may touch git).
 	// The snapshot always carries it because collectSyncBranches adds the
 	// fallback trunk.
 	trunk := plan.Trunk.Branch
 	if trunk == "" {
-		trunk = fallbackTrunk(trunkNames())
+		trunk = fallbackTrunk(trunkNamesFrom(repo))
 	}
 	trunkBehind := false
 	if trunk != "" && !plan.Trunk.FastForward {
@@ -679,7 +729,11 @@ func fastForwardSyncBranches(plan SyncPlan, snap *RemoteSnapshot) (bool, error) 
 		}
 	}
 	if needFetch {
-		if err := fetchStackOrigin(); err != nil {
+		if snap != nil {
+			if err := fetchStackOriginFrom(snap.Refs); err != nil {
+				return false, err
+			}
+		} else if err := fetchStackOrigin(); err != nil {
 			return false, err
 		}
 	}
@@ -698,9 +752,16 @@ func fastForwardSyncBranches(plan SyncPlan, snap *RemoteSnapshot) (bool, error) 
 	}
 
 	for i := range plan.Stacks {
+		catalogHead := map[string]string{}
+		for _, b := range plan.Stacks[i].Stack.Branches {
+			catalogHead[b.Branch] = b.Head
+		}
 		for _, branch := range behindByStack[i] {
 			if err := fastForwardBranch(branch); err != nil {
 				return moved, err
+			}
+			if didMove(branch, catalogHead[branch]) {
+				moved = true
 			}
 		}
 	}
@@ -769,21 +830,39 @@ func mergedForRestack(repo *repoStackState, snap *RemoteSnapshot) map[string]boo
 // bottom branch), matching what gh-stack itself writes. Best effort: a
 // missing ref leaves its cached value alone.
 func refreshStackSHAs(repo *repoStackState) {
+	if repo == nil {
+		return
+	}
+	// One facts load, then map lookups. The trunk tip is reused as the
+	// bottom branch's base. Each later base is the previous branch's tip,
+	// already read above.
+	_, _ = gitFacts()
 	for i := range repo.Stacks {
 		s := &repo.Stacks[i].trackedStack
-		if h, err := branchHead(s.Trunk.Branch); err == nil {
-			s.Trunk.Head = h
+		trunkSHA, trunkOK := "", false
+		if s.Trunk.Branch != "" {
+			if h, err := branchHead(s.Trunk.Branch); err == nil {
+				s.Trunk.Head = h
+				trunkSHA, trunkOK = h, true
+			}
 		}
+		var prevSHA string
+		var prevOK bool
 		for j := range s.Branches {
-			parent := s.Trunk.Branch
-			if j > 0 {
-				parent = s.Branches[j-1].Branch
+			if j == 0 {
+				if trunkOK {
+					s.Branches[j].Base = trunkSHA
+				}
+			} else if prevOK {
+				s.Branches[j].Base = prevSHA
+			}
+			prevSHA, prevOK = "", false
+			if s.Branches[j].Branch == "" {
+				continue
 			}
 			if h, err := branchHead(s.Branches[j].Branch); err == nil {
 				s.Branches[j].Head = h
-			}
-			if h, err := branchHead(parent); err == nil {
-				s.Branches[j].Base = h
+				prevSHA, prevOK = h, true
 			}
 		}
 	}
@@ -836,7 +915,7 @@ func stackAllInOtherWorktrees(stack trackedStack) bool {
 
 // didMove reports whether the branch's current SHA differs from before.
 func didMove(branch, oldSHA string) bool {
-	now, err := capture("git", "rev-parse", branch)
+	now, err := branchHead(branch)
 	if err != nil {
 		return false
 	}
@@ -853,11 +932,66 @@ func persistSyncState(repo *repoStackState) error {
 	return writeStackFile(filepath.Join(dir, ghStackCompat.StateFileName), repo.asState())
 }
 
+func restackCurrentStack(repo *repoStackState, branch string, down, up bool) error {
+	stack, err := stackForRestack(repo, branch)
+	if err != nil {
+		return err
+	}
+	scoped, trunk, err := restackScope(stack, branch, down, up)
+	if err != nil {
+		if !down && !up && stack.Trunk.Branch == branch {
+			scoped, trunk = stack.Branches, stack.Trunk.Branch
+		} else {
+			return err
+		}
+	}
+	results, _, err := CascadeRestack(scoped, RestackOpts{
+		Trunk:           trunk,
+		PauseOnConflict: true,
+	})
+	if err != nil {
+		return err
+	}
+	return persistAfterRestack(repo, results)
+}
+
+func stackForRestack(repo *repoStackState, branch string) (trackedStack, error) {
+	if repo == nil {
+		return trackedStack{}, errNotInStack(branch)
+	}
+	st := repo.asState()
+	if stack, ok := stackContaining(st, branch); ok {
+		return stack, nil
+	}
+	var found []trackedStack
+	for _, s := range st.Stacks {
+		if s.Trunk.Branch == branch {
+			found = append(found, s)
+		}
+	}
+	if len(found) == 1 {
+		return found[0], nil
+	}
+	return trackedStack{}, errNotInStack(branch)
+}
+
+func persistAfterRestack(repo *repoStackState, results []RestackResult) error {
+	for _, r := range results {
+		if !r.Moved {
+			continue
+		}
+		refreshStackSHAs(repo)
+		return persistSyncState(repo)
+	}
+	return nil
+}
+
 func cmdRestack(args []string) error {
 	fs := newFlags("restack")
 	downstack := fs.BoolP("downstack", "d", false, "restack this branch and its ancestors")
 	upstack := fs.BoolP("upstack", "u", false, "restack this branch and its descendants")
 	only := fs.BoolP("only", "o", false, "restack this branch only")
+	native := fs.Bool("native", false, "delegate to gh stack rebase")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
@@ -867,14 +1001,28 @@ func cmdRestack(args []string) error {
 	if *downstack && *upstack {
 		return fmt.Errorf("--downstack and --upstack conflict")
 	}
-	gh := []string{"stack", "rebase"}
-	if *downstack {
-		gh = append(gh, "--downstack")
+	if *native {
+		gh := []string{"stack", "rebase"}
+		if *downstack {
+			gh = append(gh, "--downstack")
+		}
+		if *upstack {
+			gh = append(gh, "--upstack")
+		}
+		return run("gh", gh...)
 	}
-	if *upstack {
-		gh = append(gh, "--upstack")
+	branch, err := currentBranch()
+	if err != nil {
+		return err
 	}
-	return run("gh", gh...)
+	repo, err := loadNativeRepo()
+	if err != nil {
+		return err
+	}
+	if hits := repo.ambiguous(branch); len(hits) > 0 {
+		return errAmbiguous(branch, hits)
+	}
+	return restackCurrentStack(repo, branch, *downstack, *upstack)
 }
 
 func cmdContinue(args []string) error { return resume("--continue", args) }
@@ -884,12 +1032,18 @@ func resume(flag string, args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("unexpected argument %q", args[0])
 	}
+	if pausedGitRebase() {
+		if flag == "--continue" && os.Getenv("GIT_EDITOR") == "" {
+			_ = os.Setenv("GIT_EDITOR", "true")
+		}
+		return run("git", "rebase", flag)
+	}
 	op, err := pausedOperation()
 	if err != nil {
 		return err
 	}
 	if op == "" {
-		return fmt.Errorf("no gh stack rebase or modify is in progress")
+		return fmt.Errorf("no rebase is in progress")
 	}
 	return run("gh", "stack", op, flag)
 }
@@ -947,7 +1101,11 @@ func checkoutTarget(target string) error {
 			return err
 		}
 		if !pos.inStack {
-			return run("git", "checkout", target)
+			if err := run("git", "checkout", target); err != nil {
+				return err
+			}
+			invalidateGitFacts()
+			return nil
 		}
 	}
 	return run("gh", "stack", "checkout", target)
@@ -960,41 +1118,33 @@ func cmdGet(args []string) error {
 	return run("gh", "stack", "checkout", args[0])
 }
 
-func cmdLog(args []string) error {
-	form := ""
-	if len(args) > 0 && (args[0] == "short" || args[0] == "long") {
-		form, args = args[0], args[1:]
-	}
-	if form == "long" {
-		return run("git", append([]string{"log", "--graph", "--oneline", "--decorate", "--all"}, args...)...)
-	}
-	gh := []string{"stack", "view"}
-	if form == "short" {
-		gh = append(gh, "--short")
-	}
-	return run("gh", append(gh, args...)...)
-}
-
 func cmdPR(args []string) error {
 	return run("gh", append([]string{"pr", "view", "--web"}, args...)...)
 }
 
 // cmdTrack adopts existing Git branches into a new stack. Graphite's
-// per-branch track becomes `gh stack init` of the listed branches (or the
-// current one). It does not create a new branch; that is `gt create`.
+// per-branch track writes them into the schema v1 catalog (or the current
+// branch). It does not create a new branch; that is `gt create`. --native
+// keeps today's `gh stack init`.
 func cmdTrack(args []string) error {
 	fs := newFlags("track [branches...]")
 	base := fs.StringP("base", "b", "", "trunk for the new stack")
 	parent := fs.StringP("parent", "p", "", "Graphite parent branch")
+	native := fs.Bool("native", false, "delegate adoption to gh stack")
 	if err := parse(fs, args); err != nil {
 		return err
 	}
 	if *parent != "" {
 		return fmt.Errorf("gt track --parent has no gh stack equivalent; pass --base <trunk> and list branches bottom to top")
 	}
+	repo, err := loadNativeRepo()
+	if err != nil {
+		return err
+	}
+	trunks := trunkNamesFrom(repo)
 	trunk := *base
 	if trunk == "" {
-		trunk = fallbackTrunk(trunkNames())
+		trunk = fallbackTrunk(trunks)
 	}
 	branches := fs.Args()
 	if len(branches) == 0 {
@@ -1002,33 +1152,45 @@ func cmdTrack(args []string) error {
 		if err != nil {
 			return err
 		}
-		if trunkNames()[cur] {
+		if trunks[cur] {
 			return fmt.Errorf("on trunk %q; start a stacked branch with `gt create`, or pass names: `gt track a b`", cur)
 		}
-		pos, _, err := requireStackPosition(cur)
-		if err != nil {
+		if err := refuseAlreadyTracked(repo, cur); err != nil {
 			return err
-		}
-		if pos.inStack {
-			return fmt.Errorf("branch %q is already in a stack", cur)
 		}
 		branches = []string{cur}
 	} else {
 		for _, name := range branches {
-			if trunkNames()[name] {
+			if trunks[name] {
 				return fmt.Errorf("%q is a trunk; omit it and pass --base %s", name, name)
 			}
-			pos, _, err := requireStackPosition(name)
-			if err != nil {
+			if err := refuseAlreadyTracked(repo, name); err != nil {
 				return err
-			}
-			if pos.inStack {
-				return fmt.Errorf("branch %q is already in a stack", name)
 			}
 		}
 	}
-	gh := append([]string{"stack", "init", "--base", trunk}, branches...)
-	return run("gh", gh...)
+	if *native {
+		gh := append([]string{"stack", "init", "--base", trunk}, branches...)
+		return run("gh", gh...)
+	}
+	if err := applyTrackToRepo(repo, trunk, branches); err != nil {
+		return err
+	}
+	return persistSyncState(repo)
+}
+
+func refuseAlreadyTracked(repo *repoStackState, name string) error {
+	if hits := repo.ambiguous(name); len(hits) > 0 {
+		return errAmbiguous(name, hits)
+	}
+	pos := locate(repo.asState(), name)
+	if pos.forked {
+		return errForked(name)
+	}
+	if pos.inStack {
+		return fmt.Errorf("branch %q is already in a stack", name)
+	}
+	return nil
 }
 
 func cmdInit(args []string) error {

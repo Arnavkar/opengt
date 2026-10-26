@@ -124,6 +124,9 @@ func deleteFinishedStack(names []string) error {
 	if err != nil {
 		current = ""
 	}
+	// Checkout and branch deletion both move refs. Drop the snapshot before
+	// either, so a later restack in this process does not read the old tips.
+	invalidateGitFacts()
 	trunk := fallbackTrunk(trunkNames())
 	for _, name := range names {
 		if name == current {
@@ -246,16 +249,27 @@ func stalePickRows(stale []staleBranch) []pickRow {
 }
 
 func listLocalBranches() ([]localBranch, error) {
-	out, err := capture("git", "for-each-ref",
-		"--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)",
-		"refs/heads")
+	facts, err := gitFacts()
 	if err != nil {
 		return nil, err
 	}
-	return parseLocalBranches(out), nil
+	out := make([]localBranch, len(facts.locals))
+	copy(out, facts.locals)
+	return out, nil
 }
 
 func listTrackedStackGroups() ([][]localBranch, error) {
+	st, err := loadForestState()
+	if err != nil {
+		return nil, err
+	}
+	return listTrackedStackGroupsFrom(st)
+}
+
+func listTrackedStackGroupsFrom(st *stackState) ([][]localBranch, error) {
+	if st == nil {
+		return nil, nil
+	}
 	locals, err := listLocalBranches()
 	if err != nil {
 		return nil, err
@@ -263,10 +277,6 @@ func listTrackedStackGroups() ([][]localBranch, error) {
 	byName := map[string]localBranch{}
 	for _, b := range locals {
 		byName[b.name] = b
-	}
-	st, err := loadForestState()
-	if err != nil {
-		return nil, err
 	}
 	var groups [][]localBranch
 	for _, s := range st.Stacks {
@@ -412,9 +422,17 @@ func upstreamBranch(upstream string) string {
 }
 
 func trunkNames() map[string]bool {
+	repo, err := loadNativeRepo()
+	if err != nil {
+		return trunkNamesFrom(nil)
+	}
+	return trunkNamesFrom(repo)
+}
+
+func trunkNamesFrom(repo *repoStackState) map[string]bool {
 	m := map[string]bool{}
-	if st, err := loadForestState(); err == nil {
-		for _, s := range st.Stacks {
+	if repo != nil {
+		for _, s := range repo.Stacks {
 			if s.Trunk.Branch != "" {
 				m[s.Trunk.Branch] = true
 			}
@@ -453,6 +471,7 @@ func deleteLocalBranch(name, current, fallback string) error {
 			return err
 		}
 	}
+	invalidateGitFacts()
 	return run("git", "branch", "-D", name)
 }
 
@@ -482,6 +501,7 @@ func dropBranchesFromStackFiles(names map[string]bool) error {
 		if err := os.WriteFile(path, updated, 0o644); err != nil {
 			return err
 		}
+		invalidateCatalogCache()
 	}
 	return nil
 }

@@ -19,11 +19,10 @@ import (
 //     the same topology.
 
 type stackStateSource struct {
-	Path         string
-	WorktreePath string
-	GitDir       string
-	State        *stackState
-	ReadErr      error
+	Path    string
+	GitDir  string
+	State   *stackState
+	ReadErr error
 }
 
 type repoStackState struct {
@@ -401,9 +400,8 @@ func discoverStackSources() ([]stackStateSource, error) {
 	var sources []stackStateSource
 	for _, loc := range infos {
 		src := stackStateSource{
-			Path:         loc.StackFile,
-			WorktreePath: loc.WorktreePath,
-			GitDir:       loc.GitDir,
+			Path:   loc.StackFile,
+			GitDir: loc.GitDir,
 		}
 		st, err := readStackFile(loc.StackFile)
 		if os.IsNotExist(err) {
@@ -415,13 +413,40 @@ func discoverStackSources() ([]stackStateSource, error) {
 	return sources, nil
 }
 
+type catalogSnapshot struct {
+	ready bool
+	repo  *repoStackState
+}
+
+var catalogCache catalogSnapshot
+
+func invalidateCatalogCache() {
+	catalogCache = catalogSnapshot{}
+}
+
 func loadRepoStacks() (*repoStackState, error) {
+	return loadRepoStacksCached(true)
+}
+
+// loadNativeRepo is the in-process load. A catalog that is already schema v1,
+// or no catalog yet (first create), does not need the gh-stack binary. A
+// read error or any other schema still probes.
+func loadNativeRepo() (*repoStackState, error) {
+	return loadRepoStacksCached(false)
+}
+
+func loadRepoStacksCached(probe bool) (*repoStackState, error) {
+	if catalogCache.ready {
+		return catalogCache.repo, nil
+	}
 	sources, err := discoverStackSources()
 	if err != nil {
 		return nil, fmt.Errorf("not a git repository")
 	}
-	if err := requireGhStack(); err != nil {
-		return nil, err
+	if probe || !catalogIsSchemaV1(sources) {
+		if err := requireGhStack(); err != nil {
+			return nil, err
+		}
 	}
 	for _, src := range sources {
 		if se, ok := src.ReadErr.(*schemaError); ok {
@@ -434,7 +459,18 @@ func loadRepoStacks() (*repoStackState, error) {
 		}
 	}
 	repo := reconcileSources(sources)
-	return &repo, nil
+	catalogCache.repo = &repo
+	catalogCache.ready = true
+	return catalogCache.repo, nil
+}
+
+func catalogIsSchemaV1(sources []stackStateSource) bool {
+	for _, src := range sources {
+		if src.ReadErr != nil || src.State == nil || src.State.SchemaVersion != 1 {
+			return false
+		}
+	}
+	return true
 }
 
 func loadState() (*stackState, error) {
@@ -458,18 +494,25 @@ func errAmbiguous(branch string, hits []resolvedStack) error {
 	return fmt.Errorf("%s", b.String())
 }
 
-func requireStackPosition(branch string) (position, *stackState, error) {
-	repo, err := loadRepoStacks()
+func requireNativePosition(branch string) (position, *repoStackState, error) {
+	repo, err := loadNativeRepo()
 	if err != nil {
 		return position{}, nil, err
 	}
 	if hits := repo.ambiguous(branch); len(hits) > 0 {
 		return position{}, nil, errAmbiguous(branch, hits)
 	}
-	st := repo.asState()
-	pos := locate(st, branch)
+	pos := locate(repo.asState(), branch)
 	if pos.forked {
-		return pos, st, errForked(branch)
+		return pos, repo, errForked(branch)
 	}
-	return pos, st, nil
+	return pos, repo, nil
+}
+
+func requireStackPosition(branch string) (position, *stackState, error) {
+	pos, repo, err := requireNativePosition(branch)
+	if err != nil {
+		return position{}, nil, err
+	}
+	return pos, repo.asState(), nil
 }

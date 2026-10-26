@@ -84,6 +84,64 @@ func TestParseWorktreeBranchPaths(t *testing.T) {
 	}
 }
 
+func TestGitFactsFromOutputs(t *testing.T) {
+	resetProcessCaches(t)
+	refs := "main\t111\torigin/main\t\t111\t1 second ago\tInitial commit\nfeature\t222\torigin/feature\t\t222\t2 seconds ago\tAdd feature\n"
+	porcelain := "" +
+		"worktree /repo\n" +
+		"HEAD abc\n" +
+		"branch refs/heads/main\n" +
+		"\n" +
+		"worktree /repo-wt\n" +
+		"HEAD def\n" +
+		"branch refs/heads/feature\n"
+	facts := gitFactsFromOutputs(refs, porcelain, "feature")
+	if facts.heads["main"] != "111" || facts.heads["feature"] != "222" || len(facts.heads) != 2 {
+		t.Fatalf("heads = %#v, want main=111 feature=222", facts.heads)
+	}
+	if facts.worktrees["main"] != "/repo" || facts.worktrees["feature"] != "/repo-wt" || len(facts.worktrees) != 2 {
+		t.Fatalf("worktrees = %#v, want main=/repo feature=/repo-wt", facts.worktrees)
+	}
+	if facts.current != "feature" {
+		t.Fatalf("current = %q, want feature", facts.current)
+	}
+	if len(facts.locals) != 2 ||
+		facts.locals[0].name != "main" || facts.locals[0].upstream != "origin/main" || facts.locals[0].gone ||
+		facts.locals[1].name != "feature" || facts.locals[1].upstream != "origin/feature" || facts.locals[1].gone {
+		t.Fatalf("locals = %#v", facts.locals)
+	}
+	if facts.commits["main"] != (branchCommit{short: "111", when: "1 second ago", subject: "Initial commit"}) ||
+		facts.commits["feature"] != (branchCommit{short: "222", when: "2 seconds ago", subject: "Add feature"}) {
+		t.Fatalf("commits = %#v", facts.commits)
+	}
+}
+
+func resetProcessCaches(t *testing.T) {
+	t.Helper()
+	cachedFacts = GitFacts{}
+	invalidateCatalogCache()
+	t.Cleanup(func() {
+		cachedFacts = GitFacts{}
+		invalidateCatalogCache()
+	})
+}
+
+func TestOriginFetchPlan_UsesSnapshotExists(t *testing.T) {
+	names := []string{"main", "a", "gone"}
+	refs := map[string]RemoteRef{
+		"main": {Branch: "main", Exists: true, RemoteSHA: "111"},
+		"a":    {Branch: "a", Exists: true, RemoteSHA: "222"},
+		"gone": {Branch: "gone", Exists: false},
+	}
+	fetch, gone := originFetchPlan(names, refs)
+	if len(fetch) != 2 || fetch[0] != "main" || fetch[1] != "a" {
+		t.Fatalf("fetch = %v, want [main a]", fetch)
+	}
+	if len(gone) != 1 || gone[0] != "gone" {
+		t.Fatalf("gone = %v, want [gone]", gone)
+	}
+}
+
 func TestParseLsRemoteHeads(t *testing.T) {
 	out := "abc123\trefs/heads/main\ndef456\trefs/heads/chore/extract-shared-utilities\n"
 	got := parseLsRemoteHeads(out)

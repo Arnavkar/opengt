@@ -14,7 +14,7 @@ legacy `gh stack` implementation with `--native`.
 
 > [!IMPORTANT]
 > `opengt` is early software. It currently supports **linear stacks only** and
-> targets `gh-stack` **v0.2.0**, state schema **v1**. When an operation cannot
+> targets `gh-stack` **v0.2.1**, state schema **v1**. When an operation cannot
 > be translated safely, it stops with an actionable error instead of guessing.
 
 ## Quick start
@@ -97,9 +97,9 @@ gt submit --stack
 have the same command surface. Some commands have different names:
 
 ```text
-gt create   → gh stack add
-gt log      → gh stack view
-gt restack  → gh stack rebase
+gt create   → git checkout -b + `.git/gh-stack`
+gt log      → catalog view
+gt restack  → git rebase cascade
 ```
 
 Others have actively conflicting meanings. Graphite's `gt modify` amends the
@@ -111,20 +111,20 @@ blindly forwarding the command.
 
 | Graphite command | What `opengt` runs |
 | --- | --- |
-| `gt create` / `gt c` | `gh stack init` for a new stack, or `gh stack add` at the top of an existing stack |
-| `gt modify` / `gt m` | `git commit [--amend]`, then `gh stack rebase --upstack --no-trunk` |
+| `gt create` / `gt c` | `git checkout -b` and write schema v1. `--native` is `gh stack init` / `gh stack add` |
+| `gt modify` / `gt m` | `git commit [--amend]`, then rebase the upstack. `--native` is `gh stack rebase --upstack --no-trunk` |
 | `gt submit` / `gt s` / `gt ss` | validate + plan + atomic push + PR create/update + stack update. `--native` falls back to `gh stack submit` |
-| `gt sync` | fetch (targeted ls-remote) + fast-forward trunk/branches + cascade restack + prune. `--native` falls back to `gh stack rebase` |
-| `gt restack` | `gh stack rebase` (`-d`/`-u` map to `--downstack`/`--upstack`) |
+| `gt sync` | fetch (targeted ls-remote) + fast-forward trunk/branches + cascade restack + prune |
+| `gt restack` | `git rebase` cascade (`-d`/`-u` scope downstack/upstack). `--native` is `gh stack rebase` |
 | `gt doctor` | diagnose Git vs local `gh-stack` vs worktrees vs GitHub (`--repair`, `--json`) |
-| `gt continue` / `gt abort` | Continue or abort the paused `gh stack rebase` or `gh stack modify` |
+| `gt continue` / `gt abort` | Continue or abort the paused `git rebase`, else `gh stack rebase` / `gh stack modify` |
 | `gt checkout` / `gt co` | tree of local stacks, or `gh stack checkout` / `git checkout` |
 | `gt delete` | same tree picker, then delete the chosen branch and restack what was above it |
 | `gt get <pr>` | `gh stack checkout <pr>` |
-| `gt log` / `gt ls` / `gt ll` | `gh stack view`, `gh stack view --short`, or `git log --graph` |
-| `gt up` / `u`, `down` / `d`, `top` / `t`, `bottom` / `b`, `trunk` | The corresponding `gh stack` navigation command |
+| `gt log` / `gt ls` / `gt ll` | catalog view, short catalog, or `git log --graph`. `--native` is `gh stack view` |
+| `gt up` / `u`, `down` / `d`, `top` / `t`, `bottom` / `b`, `trunk` | `git checkout` of the catalog neighbor. `--native` is the matching `gh stack` command |
 | `gt add`, `cherry-pick`, `rebase`, `reset`, `restore` | The same `git` command, arguments unchanged |
-| `gt track` / `gt tr` | `gh stack init --base <trunk> <branches>` (current branch if none given) |
+| `gt track` / `gt tr` | write listed branches (current if none) into schema v1. `--native` is `gh stack init --base <trunk>` |
 | `gt merge` | `gh stack merge` |
 | `gt switch` | `gh stack switch` |
 | `gt pr` | `gh pr view --web` |
@@ -198,12 +198,12 @@ model gt was written against.
 
 ## Pinning `gh-stack`
 
-This shim targets **v0.2.0** and schema **v1**. CI installs that pin
+This shim targets **v0.2.1** and schema **v1**. CI installs that pin
 (`.github/workflows/ci.yml`). The daily `gh-stack-compat` workflow tests
 `latest` as an early warning; it does not change what developers should run.
 
 ```sh
-gh extension install github/gh-stack --pin v0.2.0 --force
+gh extension install github/gh-stack --pin v0.2.1 --force
 ```
 
 A newer `gh-stack` with the same schema warns and continues. An unknown
@@ -271,7 +271,7 @@ ordinary untracked branches are left alone, even if their upstream is gone.
 
 A clean sync makes zero `gh stack` calls — one targeted `git ls-remote` plus
 one batched GraphQL call for PR discovery, then local fast-forwards and
-restacks. `--native` falls back to `gh stack rebase` for the legacy behavior.
+restacks.
 
 #### `gt sync` flags
 
@@ -280,15 +280,13 @@ restacks. `--native` falls back to `gh stack rebase` for the legacy behavior.
 | `-d`, `--delete-all` | delete stale stack branches without prompting |
 | `--no-restack` | skip the cascade restack step |
 | `-f`, `--force` | force restack even when ancestry is unchanged |
-| `--native` | delegate to the legacy `gh stack rebase` (see below) |
 
 ### `--native`: the legacy fallback
 
-`--native` makes `gt sync` and `gt submit` delegate to the legacy `gh stack`
-implementation (`gh stack rebase` / `gh stack submit`) instead of the native
-fast path. Use it when the native path refuses to proceed — for example,
-when validation finds an unsupported state — or when you simply want the
-`gh stack` behavior.
+`--native` on `gt submit`, `gt create`, `gt track`, `gt modify`, `gt restack`,
+`gt log`, and navigation delegates to the matching `gh stack` command. Use it
+when the native path refuses to proceed — for example, when validation finds
+an unsupported state — or when you simply want the `gh stack` behavior.
 
 `--native` is allowed **before any mutation** has happened (e.g. when
 pre-mutation validation fails). It is impossible **after** a mutation has
@@ -299,9 +297,9 @@ half-mutated state.
 ### `gt modify` is implemented with Git
 
 `gh stack` has no equivalent of Graphite's amend operation. `opengt` commits
-or amends with Git, then asks `gh stack` to rebase the upstack branches. If the
-current branch has no commits of its own, it creates a commit rather than
-rewriting its parent's commit.
+or amends with Git, then rebases the upstack. If the current branch has no
+commits of its own, it creates a commit rather than rewriting its parent's
+commit. `--native` keeps the old `gh stack rebase --upstack --no-trunk`.
 
 ### Checkout is a tree, like Graphite
 
@@ -372,9 +370,9 @@ untrack  unlink
 ```
 
 Graphite untracks one branch. `gh stack unstack` drops an entire stack.
-`gt track` is the exception: it maps onto `gh stack init` of the named
-branches (or the current one). `gt untrack` still refuses rather than
-unstacking more than you asked for.
+`gt track` is the exception: it writes the named branches (or the current
+one) into schema v1. `gt untrack` still refuses rather than unstacking more
+than you asked for.
 
 ### Not a stack operation
 

@@ -93,22 +93,7 @@ func exec1(name string, args []string) error {
 	return cmd.Run()
 }
 
-// extensionChecked keeps the check to once per process: gt runs one command,
-// and a failed install should not be retried within it.
-var extensionChecked bool
-
-// ensureExtension makes `gh stack` resolvable, offering to install
-// github/gh-stack when it is not. gt is a shim for that one extension, so there
-// is nothing to fall back to. It reports whether an install actually happened,
-// so a caller holding a failed command knows to retry it.
-func ensureExtension() (installed bool, err error) {
-	if extensionChecked {
-		return false, nil
-	}
-	extensionChecked = true
-	if stackExtensionAvailable() {
-		return false, nil
-	}
+func installGhStack() (bool, error) {
 	if !confirmInstall() {
 		return false, fmt.Errorf("the gh stack extension is required.\n" +
 			"    Install it with: gh extension install github/gh-stack")
@@ -168,14 +153,6 @@ func readLine(f *os.File) (string, bool) {
 		}
 		line = append(line, buf[0])
 	}
-}
-
-// stackExtensionAvailable reports whether `gh stack` resolves. It costs a
-// process, so callers only reach for it once something has already gone wrong
-// or the local stack state looks absent.
-func stackExtensionAvailable() bool {
-	_, err := capture("gh", "stack", "--version")
-	return err == nil
 }
 
 // announce writes the command to stderr, copy-pasteable, so stdout stays clean
@@ -248,7 +225,107 @@ func gitPass(sub string) func([]string) error {
 	}
 }
 
+// GitFacts is one process-local snapshot of local branch tips, worktrees,
+// and upstream tracking. It is not a second catalog and not a per-call argument.
+type GitFacts struct {
+	heads     map[string]string // refs/heads short name -> SHA
+	worktrees map[string]string // branch -> worktree path
+	current   string            // this worktree's branch
+	locals    []localBranch     // name, upstream, gone; same for-each-ref
+	commits   map[string]branchCommit
+	ready     bool
+}
+
+var cachedFacts GitFacts
+
+func gitFacts() (GitFacts, error) {
+	if cachedFacts.ready {
+		return cachedFacts, nil
+	}
+	refs, err := capture("git", "for-each-ref",
+		"--format=%(refname:short)%09%(objectname)%09%(upstream:short)%09%(upstream:track)%09%(objectname:short)%09%(committerdate:relative)%09%(contents:subject)",
+		"refs/heads")
+	if err != nil {
+		return GitFacts{}, err
+	}
+	porcelain, err := capture("git", "worktree", "list", "--porcelain")
+	if err != nil {
+		return GitFacts{}, err
+	}
+	current, err := capture("git", "branch", "--show-current")
+	if err != nil {
+		return GitFacts{}, fmt.Errorf("not a git repository")
+	}
+	cachedFacts = gitFactsFromOutputs(refs, porcelain, current)
+	return cachedFacts, nil
+}
+
+func gitFactsFromOutputs(refs, porcelain, current string) GitFacts {
+	heads, locals, commits := parseForEachRefFacts(refs)
+	return GitFacts{
+		heads:     heads,
+		worktrees: parseWorktreeBranchPaths(porcelain),
+		current:   current,
+		locals:    locals,
+		commits:   commits,
+		ready:     true,
+	}
+}
+
+// parseForEachRefFacts splits one for-each-ref stream into tips, upstream
+// fields, and the commit line used by gt log. Columns are name, SHA,
+// upstream short name, upstream track, short SHA, relative date, subject.
+func parseForEachRefFacts(out string) (map[string]string, []localBranch, map[string]branchCommit) {
+	heads := map[string]string{}
+	commits := map[string]branchCommit{}
+	var locals []localBranch
+	for _, line := range strings.Split(out, "\n") {
+		if line == "" {
+			continue
+		}
+		name, rest, ok := strings.Cut(line, "\t")
+		if !ok || name == "" {
+			continue
+		}
+		sha, rest, _ := strings.Cut(rest, "\t")
+		upstream, rest, _ := strings.Cut(rest, "\t")
+		track, rest, _ := strings.Cut(rest, "\t")
+		short, rest, _ := strings.Cut(rest, "\t")
+		when, subject, _ := strings.Cut(rest, "\t")
+		heads[name] = sha
+		locals = append(locals, localBranch{
+			name:     name,
+			upstream: upstream,
+			gone:     strings.Contains(track, "gone"),
+			local:    true,
+		})
+		if short != "" || when != "" || subject != "" {
+			commits[name] = branchCommit{short: short, when: when, subject: subject}
+		}
+	}
+	return heads, locals, commits
+}
+
+func invalidateGitFacts() {
+	cachedFacts = GitFacts{}
+}
+
+// noteHead records a ref this process just moved. A cache that is not ready
+// stays empty: a one-branch map would hide every other name from rev-parse.
+func noteHead(branch, sha string) {
+	if branch == "" || sha == "" || !cachedFacts.ready {
+		return
+	}
+	if cachedFacts.heads == nil {
+		cachedFacts.heads = map[string]string{}
+	}
+	cachedFacts.heads[branch] = sha
+}
+
 func currentBranch() (string, error) {
+	if cachedFacts.ready && cachedFacts.current != "" {
+		return cachedFacts.current, nil
+	}
 	b, err := capture("git", "branch", "--show-current")
 	if err != nil {
 		return "", fmt.Errorf("not a git repository")
@@ -271,7 +348,7 @@ func fastForwardBranch(branch string) error {
 	if run2("git", "rev-parse", "--verify", "--quiet", remote) != nil {
 		return nil
 	}
-	local, err := capture("git", "rev-parse", branch)
+	local, err := branchHead(branch)
 	if err != nil {
 		return nil
 	}
@@ -290,10 +367,17 @@ func fastForwardBranch(branch string) error {
 	if err != nil {
 		return err
 	}
+	var move error
 	if wt == "" {
-		return run("git", "branch", "--force", "--", branch, remote)
+		move = run("git", "branch", "--force", "--", branch, remote)
+	} else {
+		move = run("git", "-C", wt, "merge", "--ff-only", remote)
 	}
-	return run("git", "-C", wt, "merge", "--ff-only", remote)
+	if move != nil {
+		return move
+	}
+	noteHead(branch, want)
+	return nil
 }
 
 // fastForwardTrunk is a thin wrapper that fetches origin (targeted, per
@@ -312,36 +396,65 @@ func fastForwardTrunk() error {
 // A full `git fetch` / `git remote prune origin` would walk every remote
 // branch, which is far more than sync needs.
 func fetchStackOrigin() error {
+	return fetchNamedOrigin(nil)
+}
+
+// fetchStackOriginFrom uses a snapshot's ls-remote result so dirty sync
+// does not ask origin for the same heads twice.
+func fetchStackOriginFrom(refs RemoteRefSnapshot) error {
+	return fetchNamedOrigin(refs.Refs)
+}
+
+func fetchNamedOrigin(known map[string]RemoteRef) error {
 	names := stackFetchNames()
 	if len(names) == 0 {
 		return nil
 	}
-	args := append([]string{"ls-remote", "--heads", "origin"}, names...)
-	out, err := capture("git", args...)
-	if err != nil {
-		return err
-	}
-	live := map[string]bool{}
-	var fetch []string
-	for _, name := range parseLsRemoteHeads(out) {
-		if live[name] {
-			continue
+	var fetch, gone []string
+	if known != nil {
+		fetch, gone = originFetchPlan(names, known)
+	} else {
+		args := append([]string{"ls-remote", "--heads", "origin"}, names...)
+		out, err := capture("git", args...)
+		if err != nil {
+			return err
 		}
-		live[name] = true
-		fetch = append(fetch, name)
+		live := map[string]bool{}
+		for _, name := range parseLsRemoteHeads(out) {
+			if live[name] {
+				continue
+			}
+			live[name] = true
+			fetch = append(fetch, name)
+		}
+		for _, name := range names {
+			if !live[name] {
+				gone = append(gone, name)
+			}
+		}
 	}
 	if len(fetch) > 0 {
 		if err := run("git", append([]string{"fetch", "origin"}, fetch...)...); err != nil {
 			return err
 		}
 	}
-	for _, name := range names {
-		if live[name] {
-			continue
-		}
+	for _, name := range gone {
 		_ = run2("git", "update-ref", "-d", "refs/remotes/origin/"+name)
 	}
 	return nil
+}
+
+// originFetchPlan is the snapshot-backed fetch decision: fetch names the
+// snapshot says exist, drop remote-tracking refs for the rest.
+func originFetchPlan(names []string, refs map[string]RemoteRef) (fetch, gone []string) {
+	for _, name := range names {
+		if ref, ok := refs[name]; ok && ref.Exists {
+			fetch = append(fetch, name)
+			continue
+		}
+		gone = append(gone, name)
+	}
+	return fetch, gone
 }
 
 func stackFetchNames() []string {
@@ -388,6 +501,9 @@ func parseLsRemoteHeads(out string) []string {
 }
 
 func worktreePathForBranch(name string) (string, error) {
+	if facts, err := gitFacts(); err == nil && facts.ready {
+		return facts.worktrees[name], nil
+	}
 	out, err := capture("git", "worktree", "list", "--porcelain")
 	if err != nil {
 		return "", err
@@ -429,9 +545,8 @@ func gitStackDir() (string, error) {
 }
 
 type stackLocation struct {
-	GitDir       string
-	WorktreePath string
-	StackFile    string
+	GitDir    string
+	StackFile string
 }
 
 func gitStackFiles() ([]string, error) {
@@ -455,26 +570,9 @@ func listStackLocations() ([]stackLocation, error) {
 		return nil, err
 	}
 	return []stackLocation{{
-		GitDir:       common,
-		WorktreePath: worktreePathByGitDir()[common],
-		StackFile:    filepath.Join(common, ghStackCompat.StateFileName),
+		GitDir:    common,
+		StackFile: filepath.Join(common, ghStackCompat.StateFileName),
 	}}, nil
-}
-
-func worktreePathByGitDir() map[string]string {
-	out, err := capture("git", "worktree", "list", "--porcelain")
-	if err != nil {
-		return nil
-	}
-	m := map[string]string{}
-	for _, path := range parseWorktreePaths(out) {
-		dir, err := worktreeGitDir(path)
-		if err != nil {
-			continue
-		}
-		m[dir] = path
-	}
-	return m
 }
 
 func worktreeGitDir(path string) (string, error) {
@@ -499,16 +597,6 @@ func worktreeGitDir(path string) (string, error) {
 	return capture("git", "-C", path, "rev-parse", "--path-format=absolute", "--git-dir")
 }
 
-func parseWorktreePaths(out string) []string {
-	var paths []string
-	for _, line := range strings.Split(out, "\n") {
-		if strings.HasPrefix(line, "worktree ") {
-			paths = append(paths, strings.TrimPrefix(line, "worktree "))
-		}
-	}
-	return paths
-}
-
 func isLocalBranch(name string) bool {
 	return run2("git", "show-ref", "--verify", "--quiet", "refs/heads/"+name) == nil
 }
@@ -530,6 +618,11 @@ func isAncestorQuiet(parent, child string) bool {
 }
 
 func branchHead(name string) (string, error) {
+	if facts, err := gitFacts(); err == nil {
+		if sha, ok := facts.heads[name]; ok {
+			return sha, nil
+		}
+	}
 	return capture("git", "rev-parse", "--verify", "--quiet", name)
 }
 
